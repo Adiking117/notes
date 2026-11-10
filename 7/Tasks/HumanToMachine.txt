@@ -1,0 +1,65 @@
+Tasks 1, 4, 5, 9, and 11 all share the exact same architectural blueprint: The Human-to-Machine Edge Access Pattern.
+
+Unlike the machine-to-machine API workflows (which rely on mTLS and Secrets Manager), these tasks handle living, breathing doctors and researchers accessing web UIs via their browsers. They operate strictly within the Tenant-Isolated Hospital VPCs (Block 3) and never route through the OmniHealth SaaS Hub (Block 2).
+
+Here is the master execution flow for how all of these UI access tasks operate at a Principal-Architect level.
+
+The Master Execution Flow: Human UI Access
+Step 1: The Post-Quantum Browser Connection
+The Action: A human user (doctor, clinician, or researcher) types the application URL into their web browser (e.g., [https://emr.hospital-a.com](https://emr.hospital-a.com)).
+
+The Enterprise Standard: The browser initiates a connection with the Hospital’s Public Application Load Balancer (ALB). To defend against "Harvest Now, Decrypt Later" threats, the ALB negotiates Hybrid Post-Quantum TLS 1.3 (X25519MLKEM768). This mathematically guarantees that patient data displayed on the doctor's screen cannot be decrypted by a quantum computer intercepting the Wi-Fi or ISP traffic decades from now.
+
+Step 2: Edge Defense (AWS WAF & Path Routing)
+The Action: The packet reaches the Hospital’s Public ALB in the public subnet.
+
+The Enterprise Standard:
+
+AWS WAF (Web Application Firewall) inspects the incoming HTTPS request. It blocks known malicious IP addresses, scrubs for Cross-Site Scripting (XSS), and stops brute-force bot login attempts.
+
+ALB Listener Rules: The ALB looks at the URL path. It knows that machine traffic targeting /fhir/* requires mTLS and bypasses human login. Because the human is accessing the root UI path (/*), the ALB intercepts the request.
+
+Step 3: Identity Decoupling (Amazon Cognito SSO & MFA)
+The Action: The ALB pauses the request and checks for a valid session cookie.
+
+The Enterprise Standard: If no valid cookie exists, the ALB automatically redirects the user's browser to the Amazon Cognito User Pool (Cognito-Pool-Hospital-A or B).
+
+The user is prompted for their Active Directory credentials and a Time-Based One-Time Password (MFA / 2FA).
+
+Upon successful authentication, Cognito passes an OIDC authorization code back to the ALB. The ALB exchanges this for tokens, sets a secure HTTP-only session cookie in the doctor's browser, and finally allows the traffic to proceed.
+
+Why this matters: The backend applications (OpenEMR, Omniviewer) are completely shielded from managing passwords or login screens. Unauthenticated traffic is physically blocked at the cloud perimeter before it even reaches the application server.
+
+Step 4: Intra-VPC Routing & High Availability
+The Action: The ALB forwards the authenticated traffic down into the Private Subnet (which has no inbound internet access).
+
+The Enterprise Standard:
+
+The traffic reaches an Nginx Reverse Proxy running on a containerized Amazon ECS (Fargate) cluster deployed across 3 Availability Zones (Multi-AZ). If one AWS data center catches fire, traffic instantly shifts to the remaining two AZs with zero downtime.
+
+Nginx routes the traffic to the specific internal port of the requested application (e.g., Port 80 for OpenEMR, Port 3000 for Omniviewer, Port 8000 for the DICOM server).
+
+Step 5: Data Retrieval & Ransomware Protection
+The Action: The application queries its local database to render the UI for the doctor.
+
+The Enterprise Standard: OpenEMR pulls patient data from the Amazon RDS (MySQL) instance. This database runs in Multi-AZ Standby mode. More importantly, the database is backed up daily using AWS Backup Vault Lock (WORM Compliance Mode), guaranteeing that even if a hacker compromises a doctor's Cognito credentials and deploys ransomware, the hospital's database backups cannot be deleted or encrypted.
+
+Step 6: The Exfiltration Guardrail (DNS Firewall)
+The Enterprise Standard: While the application renders the UI, if any compromised open-source library inside the Omniviewer or OpenEMR container attempts to secretly phone home to a hacker's command server, the AWS Route 53 Resolver DNS Firewall (The Walled Garden) intercepts the DNS query at the VPC layer and permanently drops it, triggering an instant security alarm.
+
+How This Maps to Your Specific Tasks
+Even though the underlying security architecture is identical, here is exactly who accesses what:
+
+Inside Block 3: Hospital A VPC
+
+Task 1 (OpenEMR A): A doctor accesses [https://emr.hospital-a.com](https://emr.hospital-a.com). Cognito (Cognito-Pool-Hospital-A) authenticates them. Nginx routes traffic to the OpenEMR container.
+
+Task 4 (Knowledge Graph): A researcher accesses [https://kg.hospital-a.com](https://kg.hospital-a.com). Because they are already logged into OpenEMR A, Cognito provides Single Sign-On (SSO)—the ALB recognizes the session cookie and lets them right in without a second login prompt.
+
+Task 5 (Omniviewer): A radiologist accesses [https://omniviewer.hospital-a.com](https://omniviewer.hospital-a.com). They enjoy the same SSO experience, and Nginx routes them to the spatial viewer running on port 3000.
+
+Inside Block 3: Hospital B VPC
+
+Task 9 (OpenEMR B): A doctor at the second hospital accesses [https://emr.hospital-b.com](https://emr.hospital-b.com). The request hits Hospital B's completely isolated infrastructure. They authenticate against a completely separate user pool (Cognito-Pool-Hospital-B).
+
+Task 11 (OpenMRS): A clinician accesses [https://openmrs.hospital-b.com](https://openmrs.hospital-b.com). Cognito B provides SSO, and Nginx routes them to the OpenMRS instance.

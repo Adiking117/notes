@@ -1,0 +1,162 @@
+OmniHealth Enterprise SaaS Platform: Master Architecture & Technical Specification
+Status: Production-Grade (HIPAA/HITRUST Compliant)
+Cloud Provider: Amazon Web Services (AWS)
+Architecture Pattern: Zero-Trust Multi-Tenant Integration Broker
+
+1. Executive Summary
+OmniHealth is an enterprise-grade, cloud-native integration broker that securely routes, translates, and audits healthcare telemetry (wearables, IoT, EMR transfers) across isolated hospital networks. This architecture strictly separates human interaction from machine-to-machine pipelines, enforces Zero-Trust networking via Mutual TLS (mTLS), and guarantees compliance through a Zero-PHI (Protected Health Information) retention policy backed by cryptographic audit trails.
+
+2. Core Architectural Principles (The Enterprise Mandate)
+This platform is engineered to pass strict enterprise security reviews by enforcing five pillars:
+
+Zero-Trust Identity Decoupling: Humans authenticate via Amazon Cognito (SSO/MFA) at the hospital perimeter. Automated pipelines authenticate via AWS Secrets Manager (Auto-rotating OIDC tokens) and passwordless IAM Execution Roles.
+
+Zero-PHI Data Retention (Claim-Check Pattern): The OmniHealth Hub serves exclusively as a transit layer. Large clinical payloads are staged in an Ephemeral S3 Bucket, queued via SQS FIFO, delivered to the target, and immediately purged upon a 200 OK response.
+
+Cryptographic Non-Repudiation (WORM Auditing): Every data movement logs a lightweight, non-PHI receipt (containing the transaction hash and Correlation-ID) into an Amazon S3 Object Lock (7-Year WORM) bucket, proving to auditors that no patient data was retained.
+
+Static Egress & mTLS: All OmniHealth backend workers route outbound internet traffic through an AWS Network Firewall and an AWS NAT Gateway (Static Elastic IP). Hospitals whitelist this single IP and enforce mTLS X.509 client certificates to block all unauthorized network traffic.
+
+Distributed Traceability: AWS X-Ray injects an X-Correlation-ID at the Edge, tracing the lifespan of a payload across ALBs, Mirth, queues, and Lambdas.
+
+3. High-Level Network Topology
+Block 1: The Edge (Data Producers & End Users)
+External Data Sources: Mobile Apps (Fitbit sync), Bedside Monitors (HL7 streams), and IoT Sensors (Water quality).
+
+Human Actors: Clinical staff, doctors, and researchers accessing web UIs via TLS 1.3.
+
+Block 2: OmniHealth SaaS Hub (The Integration Broker VPC)
+Public Subnet:
+
+Hub ALB + AWS WAF: Terminates incoming streaming telemetry (HL7/JSON) and scrubs payloads.
+
+Regional API Gateway + AWS WAF: The public entry point for synchronous mobile app requests.
+
+AWS NAT Gateway (Static EIP): The single, whitelisted outbound exit node for all OmniHealth traffic.
+
+Private Subnet (No Inbound Internet):
+
+Mirth Connect (EC2): Performs in-memory translation of HL7/JSON to FHIR R4.
+
+Amazon SQS FIFO + DLQ: Guarantees strict chronological processing of medical events.
+
+AWS Lambdas: Serverless workers invoked via AWS PrivateLink.
+
+Ephemeral S3 Staging Bucket: Temporary storage for payloads, governed by 24h auto-delete lifecycles.
+
+Security & Governance Plane:
+
+AWS Secrets Manager: Vaults OIDC/OAuth token lifecycles encrypted by AWS KMS CMK.
+
+Immutable Audit Log (S3): 7-Year WORM storage for non-PHI compliance receipts.
+
+Block 3: Consumer Environments (Isolated Hospital VPCs)
+Public Subnet:
+
+Hospital ALB + AWS WAF: Enforces IP whitelists and mTLS for machines; routes humans to Amazon Cognito for MFA login.
+
+Private Subnet:
+
+Application Servers: EC2 instances hosting OpenEMR, Omniviewer, Knowledge Graph, and OpenMRS (routed via Nginx).
+
+Databases: Amazon RDS (MySQL) for persistent clinical storage.
+
+Internal Routing: Route 53 Private Hosted Zones resolve internal FQDNs for intra-VPC communication.
+
+4. Master Secrets & Identity Inventory
+AWS Secrets Manager (Block 2)
+Stores full OIDC/OAuth lifecycles for outbound machine-to-machine integrations:
+
+omnihealth/hospital-a/credentials: Hospital A's client_id, client_secret, token_url, access_token, and refresh_token.
+
+omnihealth/hospital-b/credentials: Hospital B's OpenEMR OIDC credentials and active tokens.
+
+omnihealth/hospital-b/openmrs: Hospital B's OpenMRS REST API credentials.
+
+omnihealth/integrations/fitbit: OmniHealth's Fitbit developer credentials and active refresh_token.
+
+Amazon Cognito User Pools (Block 3)
+Handles human authentication strictly at the hospital edge:
+
+Cognito-Pool-Hospital-A: Protects emr.hospital-a.com, omniviewer..., and kg...
+
+Cognito-Pool-Hospital-B: Protects emr.hospital-b.com and openmrs...
+
+5. The 13 End-to-End Executable Workflows
+Group 1: Human UI Access & Authentication
+Tasks 1, 4, 5, 9, 11: Web Portal Access
+
+A clinician navigates to a Hospital UI (e.g., emr.hospital-a.com).
+
+The request hits the Hospital's Public ALB.
+
+The ALB's listener rule detects the UI path (/*) and redirects the user to Amazon Cognito for MFA and SSO.
+
+Upon successful authentication, the ALB routes the traffic into the Private Subnet to the respective EC2 instance, where Nginx serves the application.
+
+Group 2: Synchronous API & Mobile Fetching
+Task 2.1: Fetch Data from Fitbit API (Cloud Sync)
+
+The Mobile App calls POST [api.omnihealth.com/fitbit/sync](https://api.omnihealth.com/fitbit/sync). API Gateway assigns an X-Correlation-ID.
+
+FITBIT_FETCHER_LAMBDA is invoked via PrivateLink. Using its IAM Role, it pulls the Fitbit refresh_token from Secrets Manager (via KMS CMK).
+
+The Lambda routes outbound through the Network Firewall and NAT Gateway, calls Fitbit’s token endpoint, and instantly saves the newly rotated tokens back to Secrets Manager.
+
+The Lambda fetches the latest vitals in-memory, logs a non-PHI receipt to the WORM Audit bucket, and returns the JSON to the Mobile App.
+
+Task 7: Generate 3D AR/VR from Omniviewer
+
+Omniviewer calls POST [api.omnihealth.com/arvr/generate](https://api.omnihealth.com/arvr/generate).
+
+ARVR_PROCESSOR_LAMBDA executes headless Blender processing in-memory.
+
+The Lambda encrypts the resulting 3D mesh via KMS CMK, stores it in an internal S3 bucket, logs the WORM receipt, and returns the asset pointer.
+
+Task 13: Mobile App Views IoT Water Quality
+
+The Mobile App calls GET [api.omnihealth.com/iot/water/latest](https://api.omnihealth.com/iot/water/latest).
+
+Because Block 2 retains zero data, IOT_DATA_FETCHER_LAMBDA fetches Hospital B's OIDC tokens from Secrets Manager.
+
+The Lambda routes outbound via the NAT Gateway/mTLS, queries Hospital B’s OpenEMR FHIR API directly, logs a WORM access receipt, and streams the live database response to the mobile app.
+
+Group 3: Asynchronous Streaming & Bedside Ingestion
+Task 2.2 (Fitbit Egress) & Task 3 (Bedside Monitors) & Task 12 (IoT Sensors)
+
+Ingress: Devices push telemetry to the Hub ALB (ingest.omnihealth.com). AWS WAF scrubs it; AWS X-Ray injects the X-Correlation-ID.
+
+In-Memory Translation: Mirth Connect normalizes the payload into FHIR R4.
+
+Claim-Check Queuing: Mirth writes the encrypted payload to the Ephemeral S3 Staging Bucket and enqueues an event pointer into an Amazon SQS FIFO Queue (ensuring chronological processing).
+
+Lambda Invocation: The SQS FIFO triggers the respective processor Lambda (e.g., OPENEMR_POST_LAMBDA) via PrivateLink.
+
+mTLS Egress: The Lambda fetches target credentials from Secrets Manager, routes through the Network Firewall and NAT Gateway (Static IP), and presents its mTLS certificate to the target Hospital ALB (/fhir/* path bypasses Cognito).
+
+Auto-Purge & Audit: Upon receiving HTTP 201 Created, the Lambda immediately deletes the SQS message, executes s3:DeleteObject on the Ephemeral bucket, and writes the Payload_SHA256 compliance receipt to the 7-Year WORM S3 Audit Bucket.
+
+Group 4: Cross-Tenant Clinical Transfers
+Task 8 (OpenEMR A to B) & Task 10 (OpenEMR B to OpenMRS)
+
+Ingress: Hospital A pushes a transfer bundle to the Hub ALB.
+
+Queuing: Mirth stages the heavy bundle in Ephemeral S3 and enqueues the pointer in hospital-transfer.fifo.
+
+Delivery: FHIR_POST_LAMBDA reads the queue, fetches Hospital B's tokens from Secrets Manager, and pushes the bundle over the NAT Gateway/mTLS connection. (If Hospital B is offline, SQS FIFO backs off exponentially).
+
+Settlement: Upon successful delivery, the Lambda executes the cryptographic purge (s3:DeleteObject) on the staged bundle and logs the transaction receipt to the WORM ledger, legally proving OmniHealth retained zero PHI.
+
+Group 5: Zero-Egress Intra-VPC Communication
+Task 6: Omniviewer Fetches Vitals from OpenEMR A
+
+Omniviewer and OpenEMR A reside in the same Hospital A VPC.
+
+Omniviewer’s backend issues a GET request to emr.internal.hospital-a.local/fhir/Patient/123.
+
+Route 53 Private Hosted Zone resolves this internally to OpenEMR A’s private IP address.
+
+Omniviewer fetches a local service token from Hospital A’s local vault and authenticates with OpenEMR A. The read traffic executes at ultra-low latency without ever touching Block 2 or the public internet.
+
+6. Architecture Sign-Off
+This architecture fulfills all technical requirements for a production-grade healthcare broker. It mitigates public attack surfaces (PrivateLink, NAT Gateway), ensures cryptographic trust (mTLS, KMS CMK, Secrets Manager), and solves the regulatory conflict of data transit via strict Zero-PHI automated workflows (Ephemeral S3 + WORM Object Lock).

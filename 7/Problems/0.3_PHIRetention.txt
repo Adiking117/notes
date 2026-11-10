@@ -1,0 +1,175 @@
+The "PHI Retention Violation" problem occurs when an integration broker (like the OmniHealth Hub) accidentally becomes a permanent system of record, warehousing highly sensitive medical data it was only supposed to route.
+
+What Would Have Happened If Ignored
+In your initial architecture, you had a single, standard Amazon S3 bucket at the bottom of the diagram receiving data from your Lambdas.
+
+The Accumulation: Every time a patient was transferred or a bedside monitor synced, the FHIR JSON payload landed in that bucket. Over a year, you accumulate 50 million patient records.
+
+The Liability: OmniHealth is legally contracted as a transit conduit, not an Electronic Medical Record (EMR) system. By permanently storing this data, you become an unauthorized PHI warehouse.
+
+The Consequence: During a HITRUST or HIPAA audit, the auditor asks: "Prove to me that you deleted Hospital A's data after delivering it." You cannot. Even if you claim your code deletes it, a standard S3 bucket offers no mathematical proof that data wasn't altered or retained. You fail the audit, face massive fines, and become a prime target for ransomware gangs looking for a centralized honeypot of medical records.
+
+How We Solved It (Architecture Integration)
+We solved this by splitting the storage layer into two mathematically enforced extremes: a Zero-Retention Ephemeral Bucket for the heavy data, and a 7-Year WORM (Write-Once-Read-Many) Audit Bucket for the receipts.
+
+The Ephemeral S3 Staging Bucket (Zero Retention)
+
+Mirth Connect writes the 15 MB patient bundle here only to bypass the SQS size limit (The Claim-Check Pattern).
+
+The instant the downstream Lambda delivers the data to Hospital B, it issues an s3:DeleteObject command to destroy the file.
+
+The Failsafe: We enforce a strict 24-hour S3 Lifecycle expiration rule. Even if the Lambda container crashes mid-execution and fails to run the delete command, AWS infrastructure physically wipes the file at midnight.
+
+The Immutable S3 Audit Bucket (WORM Compliance)
+
+When the Lambda deletes the patient data, it generates a lightweight JSON "Audit Receipt."
+
+Zero PHI: This receipt contains no patient names and no medical data. It only contains the Correlation_ID, the Source, the Destination, a SHA-256 hash of the payload, and a flag stating Staging_Data_Purged: True.
+
+S3 Object Lock (Compliance Mode): We write this receipt to a WORM-locked S3 bucket. Under Compliance Mode, this receipt is mathematically locked for exactly 7 years. Not even the AWS Root Account Administrator can alter or delete this file. It is legally admissible proof of routing.
+
+Advantages
+Bulletproof Audit Defense: You hand the auditor read-only access to the WORM bucket. They see cryptographic proof that every transaction succeeded and all PHI was destroyed instantly.
+
+Zero Toxic Data Liability: Because OmniHealth retains zero PHI at rest, the impact of a data breach on Block 2 is virtually zero. There is nothing for hackers to steal.
+
+Cost Efficiency: You only pay for storing microscopic 1 KB receipt files long-term, rather than paying to warehouse Terabytes of heavy clinical bundles.
+
+
+To solve the "PHI Retention Violation" problem from a completely blank AWS account, we must build two mathematically opposing storage systems: an ephemeral drop-zone that automatically self-destructs data, and an immutable vault that locks audit receipts for exactly 7 years.
+
+Here is the complete, standalone implementation guide.
+
+1. **Build the Ephemeral Staging Bucket (Auto-Purge):** This creates the temporary drop-zone that physically destroys data within 24 hours, guaranteeing zero PHI retention..
+1. Open the **AWS Management Console** and search for **S3**.
+2. Click **Create bucket**. Name it `omnihealth-ephemeral-staging-zone` (bucket names must be globally unique, so you may need to append a random number).
+3. Ensure **Block all public access** is checked.
+4. Under **Default encryption**, select **Server-side encryption with AWS Key Management Service keys (SSE-KMS)** and choose the default `aws/s3` key.
+5. Click **Create bucket**.
+6. Once created, click on the bucket name and navigate to the **Management** tab.
+7. Under **Lifecycle rules**, click **Create lifecycle rule**.
+8. Name the rule `24-Hour-PHI-Hard-Purge`.
+9. Under **Rule scope**, select **Apply to all objects in the bucket**. (Check the acknowledgment box that appears).
+10. Under **Lifecycle rule actions**, check **Expire current versions of objects**.
+11. In the configuration section below, set **Days after object creation** to `1`.
+12. Click **Create rule**. (Even if your code fails to delete a file, AWS will physically wipe it at midnight).
+
+
+2. **Build the Immutable WORM Audit Bucket (Object Lock):** This creates the legal attestation vault. Under Compliance Mode, not even the AWS Root user can delete these receipts..
+1. Go back to the S3 Dashboard and click **Create bucket**. Name it `omnihealth-audit-worm-vault`.
+2. Ensure **Block all public access** is checked.
+3. Under **Bucket Versioning**, select **Enable**. (This is strictly mandatory for Object Lock to function).
+4. Under **Default encryption**, select SSE-KMS with the `aws/s3` key.
+5. Scroll to the very bottom to **Advanced settings** -> **Object Lock**. Select **Enable**. Accept the warning that this permanently prevents objects from being deleted.
+6. Click **Create bucket**.
+7. Click on the new bucket, go to the **Properties** tab, and scroll down to the **Object Lock** section. Click **Edit**.
+8. Under **Default retention**, select **Enable**.
+9. **Default retention mode:** Select **Compliance**. (Do not select Governance, as administrators can bypass Governance. Auditors require Compliance mode).
+10. **Default retention period:** Type `7` and select **Years**.
+11. Click **Save changes**.
+
+
+---
+
+### Step 3: Mirth Connect Code (The Ingress Drop)
+
+Here is a sample Mirth Connect JavaScript snippet (used in a Destination Writer) that writes the heavy FHIR payload to the ephemeral staging bucket.
+
+```javascript
+// MIRTH JAVASCRIPT WRITER: Staging the heavy payload
+importPackage(java.util);
+importPackage(com.amazonaws.services.s3);
+
+try {
+    var rawPayload = connectorMessage.getRawData();
+    var correlationId = channelMap.get('X-Correlation-ID') || UUID.randomUUID().toString();
+    
+    // Initialize S3 Client
+    var s3Client = AmazonS3ClientBuilder.defaultClient();
+    var ephemeralBucket = "omnihealth-ephemeral-staging-zone";
+    var s3Key = "transfers/" + correlationId + ".json";
+    
+    // Write heavy PHI to the 24-hour self-destructing bucket
+    s3Client.putObject(ephemeralBucket, s3Key, rawPayload);
+    logger.info("PHI Staged in Ephemeral Bucket: " + s3Key);
+
+    // Note: Next, you would normally queue an SQS message with this bucket/key pointer
+    responseMap.put("HTTP_STATUS", 202);
+    return "Staged Successfully";
+
+} catch (e) {
+    logger.error("Failed to stage data: " + e.message);
+    responseMap.put("HTTP_STATUS", 500);
+    return "Error: " + e.message;
+}
+
+```
+
+---
+
+### Step 4: AWS Lambda Code (The Egress & Settlement)
+
+Here is the sample Python code for the backend Lambda. After delivering the data to the destination, it instantly deletes the heavy PHI file from the staging bucket and generates a mathematically hashed, non-PHI receipt for the 7-Year WORM bucket.
+
+```python
+import boto3
+import json
+import hashlib
+import requests
+from datetime import datetime
+
+s3_client = boto3.client('s3')
+
+EPHEMERAL_BUCKET = "omnihealth-ephemeral-staging-zone"
+WORM_BUCKET = "omnihealth-audit-worm-vault"
+
+def lambda_handler(event, context):
+    # In a real scenario, these come from the SQS event record
+    s3_key = event.get('s3_key', 'transfers/sample-123.json')
+    correlation_id = event.get('correlation_id', 'sample-123')
+    
+    try:
+        # 1. Download the heavy PHI into volatile RAM
+        s3_response = s3_client.get_object(Bucket=EPHEMERAL_BUCKET, Key=s3_key)
+        fhir_payload = s3_response['Body'].read().decode('utf-8')
+        
+        # 2. Transmit to Destination (Simulated)
+        headers = {'Content-Type': 'application/json', 'X-Correlation-ID': correlation_id}
+        # response = requests.post("https://emr.hospital-b.com/api", data=fhir_payload, headers=headers)
+        # if response.status_code != 200: raise Exception("Transmission failed")
+        
+        # 3. IMMEDIATE SETTLEMENT: Destroy the PHI from the Ephemeral Bucket
+        s3_client.delete_object(Bucket=EPHEMERAL_BUCKET, Key=s3_key)
+        print(f"PHI file {s3_key} permanently deleted from Ephemeral Staging.")
+        
+        # 4. GENERATE WORM RECEIPT: Cryptographically hash the payload (Zero PHI retained)
+        payload_hash = hashlib.sha256(fhir_payload.encode()).hexdigest()
+        
+        audit_receipt = {
+            "correlation_id": correlation_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "event": "FHIR_BUNDLE_DELIVERED",
+            "destination": "HOSPITAL_B",
+            "payload_sha256": payload_hash,
+            "staging_data_purged": True, # Legal attestation
+            "phi_persisted_in_hub": False
+        }
+        
+        # 5. Lock the receipt in the 7-Year WORM Bucket
+        receipt_filename = f"receipts/{datetime.utcnow().strftime('%Y/%m/%d')}/{correlation_id}.json"
+        
+        s3_client.put_object(
+            Bucket=WORM_BUCKET,
+            Key=receipt_filename,
+            Body=json.dumps(audit_receipt),
+            ContentType="application/json"
+        )
+        
+        print(f"Audit receipt {receipt_filename} locked in WORM vault for 7 years.")
+        return {"status": 200, "message": "Success"}
+
+    except Exception as e:
+        print(f"Error processing transfer: {str(e)}")
+        raise e
+
+```

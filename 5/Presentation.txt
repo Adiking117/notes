@@ -1,0 +1,50 @@
+Executive Briefing: OmniHealth Enterprise SaaS Architecture on Azure
+
+Part 1: The Business Context (What is OmniHealth?)
+Before diving into the network topology, it is important to align on the business problem OmniHealth solves.
+Currently, healthcare data is heavily siloed. Wearable devices (like Fitbits), bedside hospital monitors, and external IoT sensors cannot easily communicate with standard hospital Electronic Medical Record (EMR) systems.
+OmniHealth is a Multi-Tenant SaaS Integration Broker.
+We act as the secure middleware. We ingest raw telemetry from external devices, translate it into standardized healthcare formats (HL7 FHIR), and securely route it into the distinct, isolated databases of various client hospitals (e.g., Hospital A and Hospital B). We also provide a unified frontend UI (Omniviewer) for doctors to view 3D medical imaging and patient vitals.
+
+
+Part 2: The Security Mandate (Addressing Prior Feedback)
+In our previous PoC review, we identified several enterprise risks: flat networks mixing tenant data, human and machine identities sharing the same pathways, and services communicating via unauthenticated local IPs.
+This new Azure-native architecture has been entirely redesigned around strict Zero-Trust principles to solve those exact challenges. Every design decision in this diagram ensures that OmniHealth operates as a compliant, scalable SaaS broker.
+
+
+Part 3: Architecture Walkthrough (Block-by-Block)
+
+Block 1: Data Producers (The Edge)
+This is the external world. Bedside monitors, IoT water quality sensors, and our React Native mobile apps push encrypted health data over the public internet (TLS 1.3). They do not know which hospital they are talking to; they only know they are securely pushing data to the OmniHealth Hub.
+
+Block 2: OmniHealth SaaS Hub (The Integration Broker)
+This is an Azure Virtual Network (VNet) wholly owned by OmniHealth. It is the engine of our SaaS product. It never hosts hospital-specific databases; it only translates and routes data.
+ * Ingress & Perimeter: Traffic hits our public Azure Application Gateway (with WAF) to scrub for malicious payloads before entering the private subnet.
+ * Translation Engine: Mirth Connect runs on a private Azure VM. It normalizes incoming payloads into FHIR standards and stages raw data into Azure Blob Storage.
+ * Serverless Orchestration: Blob storage events trigger Azure Event Grid, which wakes up our Azure Functions (the core business logic).
+ * Zero-Trust Egress: Azure Functions proxy the standardized data out of the Hub and push it to the specific client hospital.
+ 
+Block 3: Consumer Environments (Strict Tenant Isolation)
+To comply with healthcare data privacy laws, each hospital is treated as a completely isolated tenant. Hospital A and Hospital B live in separate, dedicated Azure VNets. They share zero network infrastructure.
+ * Cost-Optimized Hosting: Inside Hospital A's VNet, a single Azure VM runs an Nginx reverse proxy. This proxy safely hosts OpenEMR, Omniviewer, and a Knowledge Graph on separate Fully Qualified Domain Names (FQDNs), backed by an Azure Database for MySQL.
+ * No Direct Database Access: OmniHealth never writes directly to a hospital's database. We route data through the hospital's official Azure Application Gateway via API calls.
+ 
+ 
+Part 4: Resolving the Core Identity Challenge (Human vs. Machine)
+The most critical upgrade in this architecture is how we separated human UI access from backend machine integration.
+
+1. Human Access (Doctors & Staff)
+ * The Solution: Microsoft Entra External ID (formerly Azure AD B2C).
+ * The Flow: When a doctor attempts to open emr.hospital-a.com in their browser, the Azure Application Gateway intercepts the request and forces them to authenticate via Microsoft Entra (with MFA). This provides a secure Single Sign-On (SSO) experience for humans across the hospital's applications.
+ 
+2. Machine Access (OmniHealth Data Pipelines)
+ * The Solution: Azure Key Vault & OAuth 2.0.
+ * The Flow: When our Azure Functions need to push data into Hospital A's OpenEMR system, they do not use human passwords or Microsoft Entra. Instead, the Azure Function fetches OpenEMR's specific machine-to-machine client_id and client_secret directly from Azure Key Vault. It dynamically exchanges these for a short-lived API Bearer token, completely bypassing human login screens.
+ 
+ 
+Part 5: Business & Technical Summary
+By migrating to this Azure topology, the OmniHealth platform achieves three major enterprise goals:
+ * Provable Tenant Isolation: Hospital A and Hospital B exist in separate VNets. A breach in Hospital A cannot physically or logically cross into Hospital B.
+ * Least-Privilege Networking: Services no longer communicate blindly via internal IP addresses. All cross-boundary communication happens over HTTPS via FQDNs.
+ * Enterprise Identity Management: Humans are verified by Microsoft Entra at the edge, while automated pipelines are authenticated dynamically via Azure Key Vault.
+This architecture scales horizontally, allowing us to onboard Hospital C and Hospital D simply by provisioning new isolated Azure VNets and dropping their API keys into our central Key Vault.

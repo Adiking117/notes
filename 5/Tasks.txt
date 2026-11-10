@@ -1,0 +1,125 @@
+To anchor your diagram, here is the compute layout based on your notes:
+
+Block 2 (OmniHealth Hub VPC): 1 EC2 Instance (Mirth).
+
+Block 3 (Hospital A VPC): 2 EC2 Instances (OpenEMR A and Omniviewer + Knowledge Graph sharing one instance via Nginx).
+
+Block 3 (Hospital B VPC): 2 EC2 Instances (OpenEMR B and OpenMRS).
+
+Here is exactly how data flows for each task, including the FQDN endpoints to write on your diagram.
+
+Task 1: OpenEMR A Website (Open by Human)
+The Flow: A doctor types the URL into their browser. The request hits Hospital A's public Application Load Balancer (ALB). Amazon Cognito intercepts the request, forces the doctor to log in with MFA, and then routes the authenticated traffic to the OpenEMR A EC2 instance.
+
+Example Endpoint: [https://emr.hospital-a.com](https://emr.hospital-a.com)
+
+Task 2: Fitbit Data to OpenEMR A
+The Flow: The React Native app posts a JSON payload over the public internet to the OmniHealth Hub. The Hub ALB decrypts it and sends it to Mirth. Mirth normalizes it and triggers the OPENEMR_POST_LAMBDA. The Lambda fetches Hospital A's OAuth token from AWS Secrets Manager and posts the data securely to Hospital A's API.
+
+Endpoints:
+
+Ingest: POST [https://ingest.omnihealth.com/fitbit](https://ingest.omnihealth.com/fitbit)
+
+Egress: POST [https://emr.hospital-a.com/fhir/Observation](https://emr.hospital-a.com/fhir/Observation)
+
+
+Task 2.1: Fetch Data from Fitbit / Google Health API (Cloud Deployment)
+Where it lives in the architecture: Inside Block 2 (OmniHealth SaaS Hub) as a dedicated serverless microservice (FITBIT_FETCHER_LAMBDA) backed by AWS Secrets Manager.
+
+Endpoints:
+Hub Trigger Endpoint: POST [https://emr.omnihealth.com/fitbit/sync](https://emr.omnihealth.com/fitbit/sync)
+Fitbit OAuth Token Endpoint: POST [https://emr.fitbit.com/oauth2/token](https://emr.fitbit.com/oauth2/token)
+Fitbit Health Data Endpoint: GET [https://emr.fitbit.com/1/user/-/activities/heart/date/today/1d.json](https://emr.fitbit.com/1/user/-/activities/heart/date/today/1d.json)
+
+Task 2.2: Post Data from Mobile to OpenEMR A
+Where it lives in the architecture: Crosses the entire perimeter from Block 1 (Mobile App) through Block 2 (OmniHealth Hub) to Block 3 (Hospital A).
+
+Endpoints:
+Public Ingest (Hub ALB): POST [https://ingest.omnihealth.com/fitbit](https://ingest.omnihealth.com/fitbit)
+Internal Handoff (PrivateLink): POST /internal/mirth-bridge
+Hospital A Ingestion (Block 3 ALB): POST [https://emr.hospital-a.com/fhir/Observation](https://emr.hospital-a.com/fhir/Observation)
+
+The mobile app triggers the Hub Lambda to fetch fresh tokens from Secrets Manager, query Fitbit's API, and return health data, which the mobile app then posts to the Hub's public ingest ALB where Mirth translates it, triggers the OPENEMR_POST Lambda using Secrets Manager credentials, and securely pushes the FHIR payload via TLS 1.3 to Hospital A's Nginx/OpenEMR FQDN.
+
+
+
+Task 3: Bedside Monitor (BSM) Data to OpenEMR A
+The Flow: The local hospital monitor emits HL7 messages over the internet to the OmniHealth Hub. The ALB routes it to Mirth, which translates HL7 to FHIR. Mirth triggers the OPENEMR_POST_LAMBDA. The Lambda fetches the token from Secrets Manager and pushes the FHIR payload to Hospital A's API.
+
+Endpoints:
+
+Ingest: POST [https://ingest.omnihealth.com/hl7](https://ingest.omnihealth.com/hl7)
+
+Egress: POST [https://emr.hospital-a.com/fhir/Observation](https://emr.hospital-a.com/fhir/Observation)
+
+Task 4: Knowledge Graph Website (Open by Human)
+The Flow: A researcher opens the site. The request hits Hospital A's ALB. Since Cognito provides Single Sign-On (SSO), if they are already logged into OpenEMR A, they bypass the login screen. The ALB forwards the traffic to the shared EC2 instance, where Nginx routes it to the Knowledge Graph port.
+
+Example Endpoint: [https://kg.hospital-a.com](https://kg.hospital-a.com)
+
+Task 5: Omniviewer Website (Open by Human)
+The Flow: A clinician opens the spatial viewer. The traffic hits Hospital A's ALB, passes Cognito SSO, hits the shared EC2 instance, and Nginx routes it to the Omniviewer application port (e.g., 3000).
+
+Example Endpoint: [https://omniviewer.hospital-a.com](https://omniviewer.hospital-a.com)
+
+Task 6: Vital Fetch in Omniviewer from OpenEMR A
+The Flow: Zero-Trust Rule Applied! Even though both apps live in Hospital A, Omniviewer UI does not query OpenEMR directly via local IP. Omniviewer makes an outbound call to the OmniHealth Hub's API Gateway. The OMNIVIEWER_FHIR_LAMBDA fetches Hospital A's API token from Secrets Manager and proxies the request back into Hospital A's secure OpenEMR API.
+
+Endpoints:
+
+Hub API: GET [https://emr.omnihealth.com/proxy/vitals](https://emr.omnihealth.com/proxy/vitals)
+
+Egress target: GET [https://emr.hospital-a.com/fhir/Patient/123](https://emr.hospital-a.com/fhir/Patient/123)
+
+Task 7: From Omniviewer Generate AR/VR
+The Flow: A user clicks "Generate 3D" in Omniviewer. The request goes to the Hub's API Gateway, triggering the ARVR_PROCESSOR_LAMBDA. The Lambda executes its Python processing logic (e.g., converting DICOM meshes via Blender) and securely saves the final AR/VR file directly into your secure backend data lake.
+
+Endpoints:
+
+Hub API: POST [https://emr.omnihealth.com/arvr/generate](https://emr.omnihealth.com/arvr/generate)
+
+Storage: AWS S3 (s3://omnihealth-demo-bucket)
+
+Task 8: Data Transfer from OpenEMR A to B
+The Flow: A script in OpenEMR A posts a transfer payload to the Hub ALB. Mirth receives it and drops it into an S3 staging bucket. This file drop triggers Amazon EventBridge, which instantly fires the FHIR_POST_LAMBDA. The Lambda grabs Hospital B's token from Secrets Manager and pushes the patient bundle to Hospital B's network.
+
+Endpoints:
+
+Ingest (From A): POST [https://ingest.omnihealth.com/transfer](https://ingest.omnihealth.com/transfer)
+
+Egress (To B): POST [https://emr.hospital-b.com/fhir/Bundle](https://emr.hospital-b.com/fhir/Bundle)
+
+Task 9: OpenEMR B Website (Open by Human)
+The Flow: A doctor at Hospital B opens the site. The request hits Hospital B's isolated ALB. Hospital B's distinct Cognito user pool authenticates the doctor and routes traffic to the OpenEMR B EC2 instance.
+
+Example Endpoint: [https://emr.hospital-b.com](https://emr.hospital-b.com)
+
+Task 10: Data Transfer from OpenEMR B to OpenMRS
+The Flow: OpenEMR B pushes data to the Hub ALB. Mirth receives it and stages it in S3. The file drop triggers EventBridge, which fires the MRS_LAMBDA. The Lambda gets OpenMRS credentials from Secrets Manager and pushes the data back down into Hospital B's network, specifically targeting the OpenMRS EC2 instance.
+
+Endpoints:
+
+Ingest: POST [https://ingest.omnihealth.com/mrs-sync](https://ingest.omnihealth.com/mrs-sync)
+
+Egress: POST [https://openmrs.hospital-b.com/ws/rest/v1]
+
+Task 11: OpenMRS Website (Open by Human)
+The Flow: A clinician opens the OpenMRS UI. The request hits Hospital B's ALB, clears Cognito SSO, and routes to the dedicated OpenMRS EC2 instance.
+
+Example Endpoint: [https://openmrs.hospital-b.com](https://openmrs.hospital-b.com)
+
+Task 12: IoT Data to OpenEMR B
+The Flow: Water quality sensors push high-volume JSON data to the Hub ALB. Mirth receives it and stages it in S3. EventBridge detects the file and triggers the IOT_STORE_LAMBDA. The Lambda formats the telemetry, fetches Hospital B's token from Secrets Manager, and pushes it to OpenEMR B.
+
+Endpoints:
+
+Ingest: POST [https://ingest.omnihealth.com/iot/water](https://ingest.omnihealth.com/iot/water)
+
+Egress: POST [https://emr.hospital-b.com/fhir/Observation](https://emr.hospital-b.com/fhir/Observation)
+
+Task 13: Mobile App to See IoT Data
+The Flow: A user opens the React Native app to view water quality trends. The app calls the Hub's API Gateway, which triggers the IOT_DATA_FETCHER_LAMBDA. The Lambda uses its IAM Execution Role to securely read the latest JSON from the S3 bucket and returns the clean data to the mobile app. (The mobile app never touches S3 directly).
+
+Endpoints:
+
+Hub API: GET [https://emr.omnihealth.com/iot/water/latest](https://emr.omnihealth.com/iot/water/latest)

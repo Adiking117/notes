@@ -1,0 +1,19 @@
+Saurabh identified four specific architectural gaps during your walkthrough and offered one major shortcut that actually simplifies your setup.
+
+1. Function Apps: Private Endpoints (Inbound) + VNet Integration & NAT Gateway (Outbound)
+What Saurabh Said: Make Function Apps Private Endpoints for inbound traffic and VNet Integrated for outbound traffic so you can give hospitals a fixed range of IP addresses to whitelist in their firewalls.
+What He Actually Meant: By default, serverless Azure Functions run on shared Microsoft hardware and use hundreds of random, changing outbound IP addresses. In the real world, Hospital A’s IT security team will block all incoming API traffic unless it comes from a known, static IP address owned by OmniHealth.
+
+
+2. End-to-End Traceability & "Zero-PHI Retention" Evidence (The Biggest Gap)
+What Saurabh Said: If you move patient data from Hospital A to Hospital B through Block 2, how do you prove to an auditor or a patient: (a) where the data is at steps 1 through 7, and (b) that OmniHealth did not permanently keep a copy of their PHI/PII in Block 2?
+What He Actually Meant: In your current diagram, Mirth writes transfer payloads into Azure Blob Storage in Block 2 before triggering Event Grid. Under HIPAA and HITRUST, an integration broker is only allowed to transmit data, not hoard patient medical records. If a payload sits in your Blob Storage indefinitely, you fail a security audit. Furthermore, if a transfer fails at Step 5, you need an audit trail showing exactly what happened without exposing raw patient names in your logs.
+
+
+3. Passwordless Internal Communication via Azure Managed Identities
+What Saurabh Said: Any Azure service-to-service communication inside Block 2 (APIM → Function App, Function App → Key Vault, Function App → Blob Storage) must use Managed Identities, not connection strings or passwords.
+What He Actually Meant: As you rightly noted on the call, Managed Identity is Azure's exact equivalent of an AWS IAM Execution Role. While your Function Apps still pull Hospital A/B's OAuth secrets out of Key Vault to talk to external hospitals, the Function App itself should never use a hardcoded password to unlock Key Vault or Blob Storage.
+
+
+4. DICOM Server Placement, Azure Container Apps & Intra-Block Shortcuts
+What Saurabh Said:The DICOM server belongs in Block 3 (Hospital VNet), not Block 2, because medical imaging belongs to the hospital.You can run Omniviewer (port 3000) and the open-source DICOM server (port 8000) as containers in Azure Container Apps (ACA) inside the hospital VNet, OR use Azure Health Data Services (which provides managed FHIR + DICOM out of the box with Private Endpoints).   Crucial Shortcut: While communication between blocks (Block 2 ↔ Block 3) must strictly use FQDNs, communication within the same block (Omniviewer talking to the DICOM server or OpenEMR inside Hospital A's VNet) can talk directly over internal VNet URLs because you are simply mocking the hospital's internal network.How to Update Your Diagram (Block 3):Show the DICOM Server inside Hospital A's private subnet alongside Omniviewer (either on the same VM, in an Azure Container Apps Environment, or as Azure Health Data Services).   

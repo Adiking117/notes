@@ -1,0 +1,260 @@
+The "Crashing Fragile Legacy Servers" problem occurs because there is a massive architectural mismatch between your infinitely scalable cloud (OmniHealth in AWS) and a hospital's aging, limited infrastructure.
+
+What Would Have Happened If Ignored
+Imagine OmniHealth's Hub goes offline for a 3-hour maintenance window. During that time, 50,000 patient vitals and transfer records buffer safely in your SQS FIFO queues.
+
+The Cloud Surge: When your Hub comes back online, AWS sees a massive backlog in SQS and instantly spins up 1,000 concurrent OPENEMR_POST_LAMBDA containers to process the queue as fast as possible.
+
+The Legacy Collapse: Hospital A’s OpenEMR system is running on a modest server in their basement with a small MySQL database pool limited to 150 concurrent connections.
+
+The Consequence: Your 1,000 parallel Lambdas slam into Hospital A's server. The hospital's CPU hits 100%, the database locks up, and the entire OpenEMR system crashes. Not only do your API requests fail, but the doctors and nurses walking the halls of Hospital A are suddenly locked out of their EMR screens. OmniHealth just accidentally executed a Distributed Denial of Service (DDoS) attack on its own customer.
+
+How We Solved It (Architecture Integration)
+We implemented Tenant-Specific Concurrency Limits and an Adaptive Circuit Breaker to protect the hospitals from our own scale.
+
+Static Throttling (SQS Maximum Concurrency Caps)
+
+Why: We need a hard ceiling on how fast we send data to a specific tenant.
+
+How: In the AWS Event Source Mapping (the bridge connecting SQS to Lambda), we set MaximumConcurrency = 10 for Hospital A, and MaximumConcurrency = 50 for Hospital B based on their known IT capacities. Even if there are 50,000 messages in Hospital A's queue, AWS will never invoke more than 10 Lambdas at the exact same millisecond. The rest of the messages wait safely in SQS.
+
+Dynamic Backpressure (The Circuit Breaker Pattern)
+
+Why: Even with a concurrency cap of 10, if Hospital A's server is rebooting or struggling, bombarding it with even 5 requests per second will make the outage worse and waste your AWS Lambda execution costs on guaranteed failures.
+
+How: We built a software Circuit Breaker (backed by a fast DynamoDB state table) inside the Lambda. It monitors the HTTP response codes from Hospital A (502 Bad Gateway, 503 Service Unavailable, 429 Too Many Requests, or timeouts > 3 seconds).
+
+Closed State (Normal): Error rates are low (under 5%). The Lambda processes messages normally.
+
+Open State (Tripped): If the error rate spikes to 20%, the Circuit Breaker trips "Open." The Lambda immediately stops hitting Hospital A and throws an error back to SQS to pause processing. It gives Hospital A's server exactly 60 seconds of complete silence to catch its breath and recover.
+
+Half-Open State (Testing): After 60 seconds, the Circuit Breaker allows exactly one test request through. If OpenEMR replies with 201 Created quickly, the breaker closes and resumes normal traffic. If it fails again, the breaker trips Open for another 2 minutes.
+
+Advantages
+Protects the Customer: You guarantee that integrating with OmniHealth will never destabilize or crash a hospital's mission-critical internal network.
+
+Saves Cloud Costs: By pausing the queue when a hospital is down, you avoid burning thousands of dollars on Lambda compute time repeatedly executing HTTP requests that are guaranteed to fail.
+
+Zero Data Loss: Because the traffic is paused dynamically, the FHIR payloads sit safely encrypted at rest inside your SQS queues until the hospital is healthy enough to ingest them.
+
+
+1. **Build the Circuit Breaker State Table (DynamoDB):** This high-speed state table tracks if the legacy hospital server is healthy or struggling..
+1. Open the **AWS Management Console** and search for **DynamoDB**.
+2. On the left navigation pane, click **Tables**, then **Create table**.
+3. **Table name:** Type `OmniHealth-Circuit-Breaker`.
+4. **Partition key:** Type `TargetSystem` and leave the data type as **String**.
+5. Leave the rest as default and click **Create table**.
+6. Once the table is active, click its name. Click the **Explore table items** button.
+7. Click **Create item**.
+8. Add the following attributes to initialize the state for Hospital A:
+* `TargetSystem` (String): `Hospital-A`
+* Click Add new attribute -> String -> `CircuitState`: `CLOSED`
+* Click Add new attribute -> Number -> `FailureCount`: `0`
+* Click Add new attribute -> Number -> `NextRetryTime`: `0`
+
+
+9. Click **Create item**.
+
+
+2. **Create the Circuit Breaker Worker Role (IAM):** This grants your Lambda the exact permissions to read/write the state and process the SQS queue..
+1. Search for **IAM** in the console. Click **Roles** -> **Create role**.
+2. **Trusted entity:** Select **AWS service** -> **Lambda**. Click **Next**.
+3. Search for and attach the `AWSLambdaSQSQueueExecutionRole` managed policy (required to read from the queue).
+4. Click **Create inline policy**. Switch to the **JSON** editor and paste:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:GetItem", 
+                "dynamodb:PutItem", 
+                "dynamodb:UpdateItem"
+            ],
+            "Resource": "arn:aws:dynamodb:*:*:table/OmniHealth-Circuit-Breaker"
+        }
+    ]
+}
+
+```
+
+5. Name the policy `CircuitBreakerDynamoDBAccess` and click **Create policy**.
+6. Name the role `OmniHealth-CircuitBreaker-Role` and click **Create role**.
+
+
+3. **Deploy the Worker Lambda:** This houses the logic to dynamically cut traffic when errors spike..
+1. Search for **Lambda** in the console. Click **Create function**.
+2. Name it `OmniHealth-Hospital-A-Worker`. Select **Python 3.12**.
+3. Under **Execution role**, select **Use an existing role** and choose `OmniHealth-CircuitBreaker-Role`.
+4. Click **Create function**.
+5. Scroll down to the Code Source editor. Paste the Python code provided in the section below and click **Deploy**.
+
+
+4. **Enforce Static Throttling (SQS Maximum Concurrency):** This is the hard ceiling that guarantees you never DDoS the hospital, regardless of how large the queue grows..
+1. On your Lambda overview screen, click **Add trigger**.
+2. Select **SQS** from the dropdown.
+3. Select your hospital's specific queue (e.g., `omnihealth-hosp-a-transfers.fifo`).
+4. **Batch size:** Set to `1`. (For fragile endpoints, processing one by one prevents sudden burst spikes).
+5. Expand **Additional settings**.
+6. **Maximum concurrency:** Check the box and type `10`.
+7. Click **Add**.
+*(Even if your queue spikes to 50,000 messages after a 3-hour downtime, AWS will now strictly cap the parallel executions to exactly 10 at any given millisecond).*
+
+
+---
+
+## AWS Lambda Code (Dynamic Circuit Breaker)
+
+This Python script evaluates the DynamoDB state *before* making the HTTP request. If the circuit is `OPEN`, it instantly fails the Lambda locally. This triggers SQS to hold the message for a later retry, granting the hospital 60 seconds of complete silence to recover.
+
+```python
+import json
+import boto3
+import time
+import requests
+from decimal import Decimal
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('OmniHealth-Circuit-Breaker')
+
+# Circuit Breaker Configuration
+TARGET_SYSTEM = 'Hospital-A'
+FAILURE_THRESHOLD = 5         # Trip breaker after 5 consecutive errors
+OPEN_TIMEOUT_SECONDS = 60     # Give the hospital 60 seconds to recover
+
+def get_circuit_state():
+    """Fetches the current health state of the legacy server."""
+    response = table.get_item(Key={'TargetSystem': TARGET_SYSTEM})
+    if 'Item' in response:
+        return response['Item']
+    return {'CircuitState': 'CLOSED', 'FailureCount': 0, 'NextRetryTime': 0}
+
+def update_circuit_state(state, failure_count, next_retry_time):
+    """Updates the DynamoDB state table."""
+    table.put_item(
+        Item={
+            'TargetSystem': TARGET_SYSTEM,
+            'CircuitState': state,
+            'FailureCount': Decimal(str(failure_count)),
+            'NextRetryTime': Decimal(str(next_retry_time))
+        }
+    )
+
+def lambda_handler(event, context):
+    # 1. READ THE CIRCUIT STATE
+    circuit = get_circuit_state()
+    current_state = circuit.get('CircuitState', 'CLOSED')
+    next_retry_time = int(circuit.get('NextRetryTime', 0))
+    current_time = int(time.time())
+    
+    # 2. EVALUATE THE BREAKER
+    if current_state == 'OPEN':
+        if current_time < next_retry_time:
+            # We are inside the 60-second silence window.
+            # FAIL FAST: Throw an error immediately without hitting the network.
+            print(f"Circuit OPEN. Dropping request to protect {TARGET_SYSTEM}.")
+            raise Exception("CircuitBreakerOpen: Waiting for hospital to recover.")
+        else:
+            # Timeout expired. Transition to HALF-OPEN to test the waters.
+            print(f"Timeout expired. Initiating Canary Request to {TARGET_SYSTEM}.")
+            current_state = 'HALF_OPEN'
+
+    # 3. PROCESS THE MESSAGE
+    for record in event['Records']:
+        payload = json.loads(record['body'])
+        
+        try:
+            # Send data to the legacy hospital server
+            hospital_url = "https://emr.hospital-a.com/fhir/Bundle"
+            response = requests.post(hospital_url, json=payload, timeout=5)
+            
+            # SUCCESS: The legacy server is healthy
+            if response.status_code in [200, 201]:
+                if current_state != 'CLOSED':
+                    print(f"Canary request succeeded. Resetting circuit to CLOSED.")
+                    update_circuit_state('CLOSED', 0, 0)
+                elif circuit.get('FailureCount', 0) > 0:
+                    # Reset failure count on a successful request
+                    update_circuit_state('CLOSED', 0, 0)
+                    
+                print("Transfer successful.")
+                return {"status": "SUCCESS"}
+            
+            # FAILURE: The legacy server is struggling (502, 503, 429)
+            else:
+                raise Exception(f"Hospital API returned HTTP {response.status_code}")
+                
+        except Exception as e:
+            print(f"Request Failed: {str(e)}")
+            
+            # 4. HANDLE TRIPPING THE CIRCUIT
+            if current_state == 'HALF_OPEN':
+                # The Canary request failed. The hospital is still down.
+                print("Canary request failed. Tripping back to OPEN state.")
+                update_circuit_state('OPEN', FAILURE_THRESHOLD, current_time + OPEN_TIMEOUT_SECONDS)
+            else:
+                # We are CLOSED, but seeing errors. Increment the failure counter.
+                failures = int(circuit.get('FailureCount', 0)) + 1
+                if failures >= FAILURE_THRESHOLD:
+                    print(f"Error Threshold ({FAILURE_THRESHOLD}) Reached. TRIPPING CIRCUIT OPEN.")
+                    update_circuit_state('OPEN', failures, current_time + OPEN_TIMEOUT_SECONDS)
+                else:
+                    print(f"Logging failure {failures}/{FAILURE_THRESHOLD}. Circuit remains CLOSED.")
+                    update_circuit_state('CLOSED', failures, 0)
+            
+            # Re-raise the exception so SQS holds onto the message for a retry later
+            raise e
+
+```
+
+
+To physically enforce this hard ceiling, you must configure the **Event Source Mapping**—the invisible bridge inside AWS that pulls messages from your SQS queue and hands them to your Lambda function.
+
+This setting (Maximum Concurrency) is different from Lambda Reserved Concurrency. It specifically tells the SQS poller: *"Do not spin up more than X concurrent Lambdas for this specific queue."*
+
+Here is the exact click-by-click setup.
+
+1. **Locate Your Tenant Worker Lambda:** Navigate to the compute worker that processes the queue..
+1. Open the **AWS Management Console** and search for **Lambda**.
+2. Click on the worker function dedicated to Hospital A (e.g., `OmniHealth-Hospital-A-Worker`).
+
+
+2. **Configure the SQS Trigger:** Access the Event Source Mapping configuration..
+1. On the Lambda overview screen, look at the **Configuration** tab.
+2. On the left menu, click **Triggers**.
+3. If the SQS trigger does not exist yet, click **Add trigger**, select **SQS**, and choose your queue (`omnihealth-hosp-a-transfers.fifo`).
+4. If the SQS trigger already exists, check the box next to it and click **Edit**.
+
+
+3. **Enforce the Maximum Concurrency Cap:** Set the mathematical limit to protect the legacy server..
+1. In the trigger configuration window, scroll down and expand **Additional settings**.
+2. Look for the checkbox labeled **Maximum concurrency**.
+3. Check the box to enable it.
+4. Type `10` in the text box.
+5. Click **Add** (or **Save** if editing).
+
+
+---
+
+### Infrastructure as Code (AWS CLI)
+
+In a production environment, you will likely automate this. When linking the SQS queue to the Lambda via the AWS CLI, you pass the `--scaling-config` parameter to set this hard ceiling dynamically.
+
+```bash
+# Get the Queue ARN
+QUEUE_ARN=$(aws sqs get-queue-attributes \
+    --queue-url https://sqs.ap-south-1.amazonaws.com/123456789012/omnihealth-hosp-a-transfers.fifo \
+    --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+
+# Map the Queue to the Lambda with a strict Maximum Concurrency of 10
+aws lambda create-event-source-mapping \
+    --function-name OmniHealth-Hospital-A-Worker \
+    --batch-size 1 \
+    --event-source-arn $QUEUE_ARN \
+    --scaling-config MaximumConcurrency=10
+
+```
+
+From this exact second forward, even if 50,000 patient records pile up in `omnihealth-hosp-a-transfers.fifo`, the AWS SQS polling fleet will strictly limit the parallel payload deliveries to exactly 10 at any given time. Hospital A's server will smoothly process a steady, safe trickle of data until the backlog is cleared.

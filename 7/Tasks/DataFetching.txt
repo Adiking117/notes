@@ -1,0 +1,359 @@
+Tasks 2.1 and 13 share a fundamentally different architectural blueprint from the previous tasks: The Synchronous API Fetch (Stateless Proxy) Pattern.
+
+Unlike the asynchronous ingestion pipelines (which use Mirth, SQS, and S3 staging), these tasks are real-time, synchronous requests where a human user is staring at their mobile app waiting for a loading spinner to finish. Because OmniHealth is a Zero-PHI transit Hub, Block 2 holds no persistent database of this information. Instead, it must securely reach out, fetch the data on the fly, and return it to the mobile app in milliseconds, leaving no trace behind.
+
+Here is the master execution flow for how these real-time synchronous fetches operate at a Principal-Architect level.
+
+The Master Execution Flow: Synchronous API Fetch
+Step 1: Synchronous Ingress & Tenant-Aware Edge Defense
+The Action: The React Native mobile app makes an HTTPS GET or POST request to the Hub’s API Gateway (e.g., [https://api.omnihealth.com/](https://api.omnihealth.com/)...).
+
+The Enterprise Standard:
+
+The connection is secured using Hybrid Post-Quantum TLS 1.3 to protect the data in transit.
+
+Because mobile APIs are highly susceptible to DDoS attacks or accidental retry loops, the request passes through AWS WAF and API Gateway Usage Plans. This enforces strict rate limits per mobile tenant (e.g., Max 50 requests/sec), preventing a malfunctioning mobile app update from taking down the entire Hub compute layer.
+
+API Gateway verifies the mobile user's JWT token, injects the X-Correlation-ID, and validates the request against a strict JSON Schema Draft-07 model to block malformed queries at the edge.
+
+Step 2: Serverless Invocation & Sub-Millisecond Secret Retrieval
+The Action: API Gateway synchronously triggers the respective Lambda (e.g., FITBIT_FETCHER_LAMBDA or IOT_DATA_FETCHER_LAMBDA) via an internal PrivateLink endpoint.
+
+The Enterprise Standard:
+
+To fetch external data, the Lambda needs authentication tokens. If 500 mobile users sync at once, querying AWS Secrets Manager directly would trigger massive API throttling and add 100ms of latency per request.
+
+Instead, the Lambda uses the AWS Parameters and Secrets Extension. It queries a local proxy (http://localhost:2773) inside its volatile RAM. This retrieves the required credentials (Fitbit OAuth tokens or Hospital B mTLS certificates) from an encrypted in-memory cache in 
+<5 ms.
+
+Step 3: Zero-Trust Egress & Exfiltration Guardrails
+The Action: The Lambda prepares to query the external system (Fitbit or Hospital B).
+
+The Enterprise Standard:
+
+As the HTTPS request leaves the Lambda, the AWS Route 53 Resolver DNS Firewall verifies the destination domain. If a compromised dependency tries to route the fetch to a hacker's domain, the DNS query is killed.
+
+The traffic routes through the AWS Network Firewall (validating the target URL) and out through the AWS NAT Gateway (Static Elastic IP).
+
+Step 4: The Live Fetch & Token State Mutation
+The Action: The Lambda authenticates and pulls the requested JSON data into its volatile RAM.
+
+The Enterprise Standard:
+
+Dynamic Token Rotation: If the fetch involves an OAuth 2.0 flow (like Fitbit), the access token might be expired. The Lambda automatically executes a refresh grant. Before it even fetches the patient data, it executes a PutSecretValue call back to AWS Secrets Manager to store the newly rotated refresh_token, ensuring the state is preserved for the next invocation.
+
+In-Memory Processing: The requested health JSON is held strictly in the Lambda's RAM. It is never written to an S3 bucket or a local disk.
+
+Step 5: Immediate Return & WORM Auditing
+The Action: The Lambda returns the data to the mobile app and logs the transaction.
+
+The Enterprise Standard:
+
+The clean, validated JSON is passed back through the API Gateway directly to the mobile app's screen.
+
+Cryptographic Audit: The Lambda computes a SHA-256 hash of the payload and writes a lightweight, non-PHI transaction receipt to the 7-Year S3 Object Lock (WORM) Bucket. This legally proves that OmniHealth facilitated the fetch without retaining the underlying clinical data.
+
+Log Redaction: If any errors occur, the CloudWatch Logs Data Protection Policy automatically scrubs the stdout streams, turning accidental PHI leaks into *****REDACTED***** before they hit the disk.
+
+How This Maps to Your Specific Tasks
+Task 2.1: Fetch Data from Fitbit API (Cloud Sync)
+
+Target: The public internet (api.fitbit.com).
+
+Execution: FITBIT_FETCHER_LAMBDA pulls the Fitbit client_id and refresh_token from the local secret cache. It routes through the NAT Gateway, calls the Fitbit OAuth server, and immediately saves the newly rotated tokens back to Secrets Manager. It fetches the heart rate/steps JSON, logs the WORM receipt, and returns the data to the mobile app.
+
+Task 13: Mobile App Views IoT Water Quality (Fetching from Hospital B)
+
+Target: Block 3 (Hospital B OpenEMR API).
+
+Execution: IOT_DATA_FETCHER_LAMBDA pulls Hospital B's OIDC tokens from the local cache. It routes through the NAT Gateway. At Hospital B's ALB, it presents its AWS Private CA client certificate to pass the Mutual TLS (mTLS) check, bypassing the human Cognito login. It queries GET [https://emr.hospital-b.com/fhir/Observation?code=water-quality](https://emr.hospital-b.com/fhir/Observation?code=water-quality). It holds the live database response in RAM, logs the WORM receipt, and streams the live water quality data back to the mobile app.
+
+
+1. **Create the Dual Secret Vaults & Enable Local Proxy:** This creates two encrypted vaults: one for Hospital B's static API keys, and one for Fitbit's dynamic OAuth tokens..
+1. Open the **AWS Management Console** and search for **Secrets Manager**.
+2. Click **Store a new secret** -> **Other type of secret**.
+3. **Vault 1 (Hospital B):** Add key `hospital_b_oidc_token` and value `dummy-token`. Name it `omnihealth/hospital-b/credentials`. Click **Store**.
+4. **Vault 2 (Fitbit):** Click **Store a new secret** again. Add keys `client_id`, `client_secret`, `access_token`, and `refresh_token`. Name it `omnihealth/fitbit/oauth`. Click **Store**.
+5. Search for **IAM** in the console. Click **Roles** -> **Create role**.
+6. **Trusted entity:** Select **AWS service** -> **Lambda**. Click **Next**.
+7. Click **Create inline policy** and paste this JSON. (Notice we explicitly allow `PutSecretValue` so the Lambda can save the rotated Fitbit token):
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"],
+        "Resource": [
+            "arn:aws:secretsmanager:*:*:secret:omnihealth/hospital-b/*",
+            "arn:aws:secretsmanager:*:*:secret:omnihealth/fitbit/*"
+        ]
+    }]
+}
+
+```
+
+8. Name the policy `SecretsManagerReadWriteAccess`. Attach `AWSLambdaVPCAccessExecutionRole`.
+9. Name the role `OmniHealth-Live-Fetcher-Role` and click **Create role**.
+
+
+2. **Deploy the Unified Synchronous Worker Lambda:** This houses the logic to fetch tokens, automatically rotate Fitbit OAuth tokens, and query both endpoints..
+1. Search for **Lambda** in the console. Click **Create function**.
+2. Name it `OmniHealth-Live-Fetcher-Worker`. Select **Python 3.12**.
+3. Under **Execution role**, choose the `OmniHealth-Live-Fetcher-Role`.
+4. Expand **Advanced settings**, check **Enable VPC**, and attach it to your Hub VPC's Private Subnets. Click **Create function**.
+5. Scroll down to the **Layers** section, click **Add a layer**, select **AWS layers**, search for **AWS-Parameters-and-Secrets-Lambda-Extension**, and add it.
+6. Go to **Configuration** -> **Environment variables** and add `SECRETS_MANAGER_TTL` with a value of `300`.
+
+
+3. **Build the Synchronous API Gateway:** This builds the mobile front door with distinct routes for Fitbit Cloud and Hospital B IoT..
+1. Search for **API Gateway** in the console. Click **Build** under **REST API**. Name it `OmniHealth-Mobile-API`.
+2. Click **Create Resource**, name it `sync`, and click **Create Resource**.
+3. Select `/sync`, click **Create Resource**, name it `fitbit`, and create.
+4. Select `/sync`, click **Create Resource** again, name it `iot`, and create.
+5. For both `/sync/fitbit` and `/sync/iot`, click **Create Method** -> **GET** -> **Lambda Proxy integration** -> Point to `OmniHealth-Live-Fetcher-Worker`.
+6. Click **Deploy API**, create a `prod` stage, and deploy.
+
+
+---
+
+## Code 1: AWS Lambda (The Unified Live Fetcher with Token Rotation)
+
+This Python Lambda acts as a smart router. It checks the API Gateway path (`/sync/fitbit` vs `/sync/iot`). For Task 13, it uses the local cache to fetch Hospital B data. For Task 2.1, it executes a live fetch to Fitbit, and if the token is expired (401), it dynamically executes an OAuth 2.0 refresh grant, updates AWS Secrets Manager, and retries the fetch.
+
+```python
+import os
+import json
+import requests
+import hashlib
+import base64
+from datetime import datetime
+import boto3
+
+s3_client = boto3.client('s3')
+secrets_client = boto3.client('secretsmanager') # Needed for PUT requests during token rotation
+WORM_BUCKET = "omnihealth-audit-worm-vault"
+
+def get_cached_secret(secret_name):
+    """Fetches secrets from the local extension RAM proxy in < 5ms"""
+    aws_token = os.environ.get('AWS_SESSION_TOKEN')
+    local_url = f"http://localhost:2773/secretsmanager/get?secretId={secret_name}"
+    response = requests.get(local_url, headers={"X-Aws-Parameters-Secrets-Token": aws_token})
+    return json.loads(response.json().get('SecretString', '{}'))
+
+def rotate_fitbit_token(client_id, client_secret, refresh_token):
+    """Executes OAuth 2.0 Refresh Grant and saves new state to AWS Secrets Manager"""
+    auth_string = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    resp = requests.post(
+        "https://api.fitbit.com/oauth2/token",
+        headers={"Authorization": f"Basic {auth_string}", "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        timeout=5
+    )
+    if resp.status_code != 200:
+        raise Exception("Fitbit Token Rotation Failed")
+        
+    new_tokens = resp.json()
+    
+    # Rebuild the secret payload
+    updated_secret = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "access_token": new_tokens['access_token'],
+        "refresh_token": new_tokens['refresh_token']
+    }
+    
+    # Write the new tokens back to AWS Secrets Manager
+    secrets_client.put_secret_value(
+        SecretId="omnihealth/fitbit/oauth",
+        SecretString=json.dumps(updated_secret)
+    )
+    return new_tokens['access_token']
+
+def write_worm_receipt(correlation_id, target, data):
+    payload_hash = hashlib.sha256(json.dumps(data).encode()).hexdigest()
+    receipt = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "correlation_id": correlation_id,
+        "event": "LIVE_SYNC_COMPLETED",
+        "target": target,
+        "payload_sha256": payload_hash,
+        "zero_phi_retained": True
+    }
+    s3_client.put_object(
+        Bucket=WORM_BUCKET,
+        Key=f"sync_receipts/{datetime.utcnow().strftime('%Y/%m/%d')}/{correlation_id}.json",
+        Body=json.dumps(receipt)
+    )
+
+def lambda_handler(event, context):
+    path = event.get('path', '')
+    correlation_id = event.get('headers', {}).get('X-Correlation-ID', f"sync-{int(datetime.utcnow().timestamp())}")
+    
+    try:
+        # =========================================================
+        # TASK 2.1: FITBIT PUBLIC CLOUD SYNC
+        # =========================================================
+        if "/sync/fitbit" in path:
+            fitbit_creds = get_cached_secret("omnihealth/fitbit/oauth")
+            access_token = fitbit_creds['access_token']
+            
+            fitbit_url = "https://api.fitbit.com/1/user/-/activities/heart/date/today/1d.json"
+            
+            # Attempt the fetch
+            resp = requests.get(fitbit_url, headers={'Authorization': f'Bearer {access_token}'}, timeout=5)
+            
+            # Dynamic Token Rotation (Handle 401 Expired Token)
+            if resp.status_code == 401:
+                print("Fitbit Token Expired. Initiating Dynamic Rotation...")
+                access_token = rotate_fitbit_token(
+                    fitbit_creds['client_id'], 
+                    fitbit_creds['client_secret'], 
+                    fitbit_creds['refresh_token']
+                )
+                # Retry fetch with new token
+                resp = requests.get(fitbit_url, headers={'Authorization': f'Bearer {access_token}'}, timeout=5)
+                
+            if resp.status_code == 200:
+                data = resp.json()
+                write_worm_receipt(correlation_id, "FITBIT_API", data)
+                return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(data)}
+            else:
+                return {"statusCode": resp.status_code, "body": json.dumps({"error": "Fitbit Sync Failed"})}
+                
+        # =========================================================
+        # TASK 13: HOSPITAL B IoT SYNC
+        # =========================================================
+        elif "/sync/iot" in path:
+            patient_id = event.get('queryStringParameters', {}).get('patient_id')
+            hosp_creds = get_cached_secret("omnihealth/hospital-b/credentials")
+            
+            hosp_url = f"https://emr.hospital-b.com/fhir/Observation?patient={patient_id}&code=water-quality"
+            resp = requests.get(
+                hosp_url, 
+                headers={'Authorization': f"Bearer {hosp_creds['hospital_b_oidc_token']}", 'X-Correlation-ID': correlation_id},
+                timeout=5
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                write_worm_receipt(correlation_id, "HOSPITAL_B_EMR", data)
+                return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(data)}
+            else:
+                return {"statusCode": resp.status_code, "body": json.dumps({"error": "Hospital IoT Sync Failed"})}
+
+    except Exception as e:
+        print(f"Sync execution error: {str(e)}")
+        return {"statusCode": 500, "body": json.dumps({"error": "Internal Hub Error"})}
+
+```
+
+---
+
+## Code 2: React Native (The Mobile Client Dashboard)
+
+This UI provides two distinct buttons for the patient to sync their external consumer data (Fitbit) and their clinical telemetry (Hospital B).
+
+```javascript
+import React, { useState } from 'react';
+import { View, Text, TouchableOpacity, ActivityIndicator, ScrollView, StyleSheet } from 'react-native';
+
+const OmniHealthDashboard = ({ patientId, userJwtToken }) => {
+  const [data, setData] = useState(null);
+  const [activeSource, setActiveSource] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  // The OmniHealth Hub API Gateway Endpoints
+  const API_BASE = 'https://api.omnihealth.com/sync';
+
+  const executeLiveSync = async (sourceType) => {
+    setIsLoading(true);
+    setError(null);
+    setData(null);
+    setActiveSource(sourceType);
+
+    const endpoint = sourceType === 'FITBIT' 
+      ? `${API_BASE}/fitbit` 
+      : `${API_BASE}/iot?patient_id=${patientId}`;
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${userJwtToken}`, 
+          'X-Correlation-ID': `req-${Date.now()}` 
+        },
+      });
+
+      if (!response.ok) throw new Error(`API Error: ${response.status}`);
+      
+      const responseData = await response.json();
+      setData(responseData);
+      
+    } catch (err) {
+      console.error(err);
+      setError("Failed to sync live data. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <ScrollView style={styles.container}>
+      <Text style={styles.header}>My Health Telemetry</Text>
+      
+      <View style={styles.buttonRow}>
+        <TouchableOpacity 
+          style={[styles.button, { backgroundColor: '#00B0B9' }]} 
+          onPress={() => executeLiveSync('FITBIT')}
+        >
+          <Text style={styles.buttonText}>Sync Fitbit Vitals</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity 
+          style={[styles.button, { backgroundColor: '#2E3B55' }]} 
+          onPress={() => executeLiveSync('IOT')}
+        >
+          <Text style={styles.buttonText}>Sync IoT Bedside Monitor</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.contentArea}>
+        {isLoading && <ActivityIndicator size="large" color="#0000ff" />}
+        
+        {error && <Text style={styles.errorText}>{error}</Text>}
+        
+        {data && !isLoading && (
+          <View style={styles.dataCard}>
+            <Text style={styles.dataHeader}>
+              Live Response ({activeSource}):
+            </Text>
+            {/* Renders the raw JSON securely fetched from the Hub in real-time */}
+            <Text style={styles.jsonText}>
+              {JSON.stringify(data, null, 2)}
+            </Text>
+          </View>
+        )}
+      </View>
+    </ScrollView>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: { flex: 1, padding: 20, backgroundColor: '#F8F9FA' },
+  header: { fontSize: 24, fontWeight: 'bold', color: '#333', marginBottom: 20 },
+  buttonRow: { flexDirection: 'column', gap: 12 },
+  button: { padding: 16, borderRadius: 8, alignItems: 'center' },
+  buttonText: { color: '#FFF', fontSize: 16, fontWeight: 'bold' },
+  contentArea: { marginTop: 30 },
+  errorText: { color: '#D9534F', fontSize: 16, textAlign: 'center' },
+  dataCard: { backgroundColor: '#FFF', padding: 15, borderRadius: 8, borderWidth: 1, borderColor: '#DDD' },
+  dataHeader: { fontSize: 16, fontWeight: 'bold', marginBottom: 10, color: '#333' },
+  jsonText: { fontFamily: 'monospace', fontSize: 12, color: '#555' }
+});
+
+export default OmniHealthDashboard;
+
+```

@@ -1,0 +1,188 @@
+The "mTLS Certificate Expiry Timebomb" occurs because the cryptographic trust between two machines relies on X.509 client certificates, which have a mathematically hardcoded expiration date (e.g., 365 days).
+
+What Would Have Happened If Ignored
+If you handle mTLS the way most Proof-of-Concepts do, a developer generates a client-cert.pem file manually using OpenSSL, sets it to expire in one year, and uploads it into the Lambda's environment or AWS Secrets Manager.
+
+ * The Timebomb: Exactly 365 days later at 2:00 AM, the certificate mathematically expires.
+
+ * The Silent Crash: When OPENEMR_POST_LAMBDA tries to deliver a critical bedside monitor alert to Hospital A, Hospital A's ALB checks the certificate, sees it is expired, and abruptly terminates the connection (SSL Handshake Failed).
+
+ * The Consequence: Because this happens at the Transport Layer (OSI Layer 4), the HTTP request is never even sent. Your application logs show zero API errors—only cryptic network timeouts. Every single integration pipeline across your entire Hub (Tasks 2.2, 3, 8, 10, 12, and 13) halts simultaneously. It takes hours of frantic debugging by senior engineers to realize a certificate expired, followed by days of manual coordination with Hospital IT teams to install a new one.
+
+
+How We Solved It (Architecture Integration)
+We completely eliminated human intervention by implementing an Automated Certificate Lifecycle using AWS Private Certificate Authority (Private CA) and Event-Driven Rotation.
+
+ * The Root of Trust (AWS Private CA)
+   * We deployed an internal AWS Private CA hierarchy (an offline Root CA and an active Subordinate CA). This acts as OmniHealth’s own enterprise certificate factory. We share the public key of this CA with Hospital A and B once during onboarding, and they place it in their ALB Trust Store.
+
+ * Event-Driven Rotation (Amazon EventBridge)
+   * Certificates are issued with short lifespans (e.g., 90 days) for higher security.
+   * We use Amazon EventBridge to monitor certificate health. Exactly 30 days before a certificate is set to expire, EventBridge fires an ACM Certificate Approaching Expiration event.
+ * Zero-Touch Deployment (The Rotation Lambda)
+   * The EventBridge alert automatically wakes up a dedicated Rotation Lambda.
+   * This Lambda calls acm-pca:IssueCertificate to generate a brand new X.509 client certificate and private key.
+   * The Lambda immediately pushes the new cryptographic material into AWS Secrets Manager, overwriting the old version.
+   * The Result: The next time OPENEMR_POST_LAMBDA executes, it pulls the fresh certificate from Secrets Manager and connects to the hospital flawlessly. The hospital accepts it because it is signed by the trusted OmniHealth Private CA.
+
+
+ * Instant Compromise Kill Switch (CRL)
+   * If a developer's laptop is stolen or a key is compromised, we click a single button in AWS. Private CA updates a Certificate Revocation List (CRL) hosted on an S3 bucket. Hospital A's ALB checks this CRL automatically and instantly drops any connection attempting to use the stolen certificate.
+
+
+Advantages
+ * Zero-Downtime Operations: The entire enterprise network stays cryptographically secure without a single engineer ever having to set a calendar reminder or manually run OpenSSL commands.
+ * Breach Containment: By automating rotation, you can safely issue certificates that are only valid for 30 or 90 days (instead of 5 years). If a key is stolen, its useful lifespan to a hacker is drastically minimized.
+ * Scalable Hospital Onboarding: You never have to email new .pem files to hospital IT departments every year. Because they trust your Private Root CA, you can rotate the downstream client certificates on your end invisibly.
+ 
+ To solve the "mTLS Certificate Expiry Timebomb" from a completely blank AWS account, we must build a fully automated cryptographic factory. We will establish an AWS Private Certificate Authority (CA), set up a Certificate Revocation List (CRL) as our kill switch, and write a Lambda function that automatically generates and rotates the keys into Secrets Manager before they expire.
+
+Here is the complete, standalone implementation guide to build the Zero-Touch mTLS Rotation architecture.
+
+1. **Create the Compromise Kill Switch (S3 CRL Bucket):** This creates the public kill-switch that hospitals will continuously check to ensure your certificates haven't been stolen..
+1. Open the **AWS Management Console** and search for **S3**.
+2. Click **Create bucket**. Name it `omnihealth-crl-public-trust` (must be globally unique).
+3. Under **Block Public Access settings**, UNCHECK **Block all public access** and acknowledge the warning. (The CRL must be publicly readable so external hospital ALBs can verify it).
+4. Under **Bucket Policy**, add a policy allowing `s3:PutObject` from the `acm-pca.amazonaws.com` service principal, and `s3:GetObject` for `*` (public read).
+5. Click **Create bucket**.
+
+
+2. **Establish the Root of Trust (AWS Private CA):** This creates your enterprise certificate factory that automatically signs the short-lived client certificates..
+1. Search for **AWS Private CA** in the console.
+2. Click **Create a private CA**.
+3. **CA type:** Select **Root CA**.
+4. **Subject distinguished name options:**
+* Organization (O): `OmniHealth Inc`
+* Common Name (CN): `OmniHealth-Automated-Root-CA`
+
+
+5. **Key algorithm:** Select **RSA 2048**.
+6. **Certificate revocation list (CRL):** Check **Enable CRL**. Select the `omnihealth-crl-public-trust` S3 bucket you created in Step 1.
+7. Click **Create CA**.
+8. Once created, select it and click **Install CA certificate**. Set the validity to 10 years.
+9. Copy the **CA ARN**. You will need this for the Lambda code. *(You will share the public key of this CA with Hospital A once, and never have to email them again).*
+
+
+3. **Create the Cryptographic Vault (AWS Secrets Manager):** This is where the backend integration Lambdas will fetch the fresh certificate at runtime..
+1. Search for **Secrets Manager** in the console.
+2. Click **Store a new secret**.
+3. **Secret type:** Select **Other type of secret**.
+4. **Key/value pairs:** Select the **Plaintext** tab. Enter a dummy JSON payload for now: `{"client_cert": "pending", "private_key": "pending"}`.
+5. Click **Next**.
+6. **Secret name:** Type `omnihealth/mtls/client-certificate`.
+7. Click **Next**, leave automatic rotation off (we will trigger it via EventBridge), and click **Store**.
+
+
+4. **Create the Rotation Lambda Role:** This requires strict permissions so the Lambda can act as the cryptographic administrator..
+1. Search for **IAM** in the console. Click **Roles**, then **Create role**.
+2. **Trusted entity:** Select **AWS service** -> **Lambda**. Click **Next**.
+3. Create an inline policy with the following exact permissions:
+* `acm-pca:IssueCertificate`
+* `acm-pca:GetCertificate`
+* `secretsmanager:PutSecretValue`
+
+
+4. Name the role `OmniHealth-mTLS-Rotator-Role` and save it.
+
+
+5. **Automate with Amazon EventBridge:** The timer that guarantees human engineers never have to remember expiration dates..
+1. Search for **EventBridge** in the console.
+2. On the left pane under **Buses**, click **Rules**. Click **Create rule**.
+3. Name it `OmniHealth-mTLS-60-Day-Rotation`.
+4. **Rule type:** Select **Schedule**. Click **Next**.
+5. **Schedule pattern:** Select **A schedule that runs at a regular rate**. Set the rate to **60 Days**. (Because we will issue 90-day certificates, this guarantees rotation 30 days before expiration).
+6. **Target:** Select **AWS Lambda** and choose the `mTLS-Rotator-Lambda` (which we will code in the next section).
+7. Click **Next** and **Create Rule**.
+
+
+---
+
+### Step 6: AWS Lambda Code (Zero-Touch Deployment)
+
+This Python Lambda wakes up every 60 days. It uses the `cryptography` library to generate a brand new RSA Private Key and Certificate Signing Request (CSR) directly in the cloud's secure memory. It hands the CSR to AWS Private CA, gets the new 90-day signed certificate, and silently overwrites the vault in Secrets Manager.
+
+*Prerequisite: You must deploy this Lambda with the `cryptography` Python package attached as a Layer or included in the `.zip` file.*
+
+```python
+import boto3
+import json
+import time
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes
+from cryptography.x509.oid import NameOID
+from cryptography import x509
+
+pca_client = boto3.client('acm-pca')
+secrets_client = boto3.client('secretsmanager')
+
+# The ARN of the Private CA you created in Step 2
+PCA_ARN = "arn:aws:acm-pca:ap-south-1:123456789012:certificate-authority/your-ca-id"
+SECRET_NAME = "omnihealth/mtls/client-certificate"
+
+def lambda_handler(event, context):
+    try:
+        print("Starting Automated mTLS Key Rotation...")
+        
+        # 1. Generate a fresh RSA Private Key in memory (never touches disk)
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+        )
+        
+        pem_private_key = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        
+        # 2. Generate the Certificate Signing Request (CSR)
+        csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"OmniHealth Hub Worker"),
+            x509.NameAttribute(NameOID.COMMON_NAME, u"omnihealth.internal"),
+        ])).sign(private_key, hashes.SHA256())
+        
+        pem_csr = csr.public_bytes(serialization.Encoding.PEM)
+        
+        # 3. Request a new 90-Day Certificate from AWS Private CA
+        response = pca_client.issue_certificate(
+            CertificateAuthorityArn=PCA_ARN,
+            Csr=pem_csr,
+            SigningAlgorithm='SHA256WITHRSA',
+            Validity={
+                'Value': 90, # Strict 90-day validity minimizes breach windows
+                'Type': 'DAYS'
+            }
+        )
+        certificate_arn = response['CertificateArn']
+        print(f"Certificate issued successfully: {certificate_arn}")
+        
+        # Wait a few seconds for PCA to finalize issuance
+        time.sleep(3)
+        
+        # 4. Retrieve the actual signed public certificate
+        cert_response = pca_client.get_certificate(
+            CertificateAuthorityArn=PCA_ARN,
+            CertificateArn=certificate_arn
+        )
+        pem_certificate = cert_response['Certificate']
+        
+        # 5. Zero-Touch Deployment: Overwrite AWS Secrets Manager
+        new_secret_payload = {
+            "private_key": pem_private_key.decode('utf-8'),
+            "client_cert": pem_certificate
+        }
+        
+        secrets_client.put_secret_value(
+            SecretId=SECRET_NAME,
+            SecretString=json.dumps(new_secret_payload)
+        )
+        
+        print("Success: New cryptographic material deployed to Secrets Manager.")
+        return {"status": 200, "message": "Rotation Complete"}
+        
+    except Exception as e:
+        print(f"CRITICAL: Certificate rotation failed: {str(e)}")
+        raise e
+
+```

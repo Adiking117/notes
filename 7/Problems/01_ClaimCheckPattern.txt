@@ -1,0 +1,198 @@
+The Claim-Check Pattern (also known as Reference-Based Messaging) solves a fundamental physics problem in cloud messaging: how do you pass massive, heavy files through a system designed only for tiny, lightweight text messages?
+
+What Would Have Happened If Ignored
+In healthcare, a single patient transfer bundle (Task 8) can contain years of clinical history, PDF lab reports, and high-resolution imaging links, easily ballooning the JSON payload to 15 MB or more.
+
+The Hard Limit: Amazon SQS has a strict, unchangeable hard limit of 256 KB per message.
+
+The Crash: If Mirth Connect tries to push a 15 MB FHIR bundle directly into your SQS FIFO queue, AWS will instantly reject the API call with a MessageTooLarge error. The transfer fails, the data is dropped, and the pipeline halts.
+
+The Anti-Pattern (The Bad Fix): An amateur developer might try to fix this by bypassing SQS entirely and writing the data directly into a permanent database (like RDS or DynamoDB) for the Lambda to read later.
+
+The Consequence: By storing the patient data permanently in a database inside Block 2, you just violated your Zero-PHI SaaS compliance rule. OmniHealth is no longer a transit broker; it is an illegal, un-audited health data warehouse. You fail your HIPAA/HITRUST audit immediately.
+
+How We Solved It (Architecture Integration)
+We implemented the Claim-Check Pattern, which separates the payload (the heavy data) from the event (the notification to process it). Think of it like checking a heavy suitcase at a hotel: you don't carry the suitcase into the restaurant; you leave it at the desk and carry a tiny paper ticket (the claim check). When you need the bag, you trade the ticket for the suitcase.
+
+Here is how it executes in your architecture:
+
+The Heavy Drop (Ephemeral S3)
+
+When Mirth Connect receives a massive 15 MB patient bundle, it does not send it to SQS.
+
+Instead, Mirth writes the 15 MB encrypted JSON file into the Amazon S3 Ephemeral Staging Bucket. S3 can hold objects up to 5 Terabytes, so size is no longer an issue.
+
+Passing the Ticket (SQS FIFO)
+
+The instant the file is saved, Mirth generates a tiny, 1 KB "claim check" pointer message:
+
+JSON
+{
+  "event": "NEW_TRANSFER",
+  "s3_bucket": "omnihealth-ephemeral-staging",
+  "s3_key": "transfers/hospital-b/bundle-9982.json",
+  "patient_group_id": "Patient-12345"
+}
+Mirth pushes this tiny JSON pointer into the Amazon SQS FIFO Queue. SQS easily accepts it and maintains the strict chronological ordering.
+
+Cashing in the Ticket (Lambda Retrieval)
+
+FHIR_POST_LAMBDA is triggered by the SQS message. It reads the tiny pointer.
+
+Using its IAM Execution Role, the Lambda reaches into the S3 Staging Bucket, downloads the 15 MB file directly into its volatile RAM, and processes the transfer outbound to Hospital B.
+
+Tearing Up the Ticket (Auto-Purging)
+
+The moment Hospital B returns a 200 OK, the Lambda executes two settlement tasks: it deletes the pointer from SQS, and it immediately executes an s3:DeleteObject call to permanently erase the 15 MB file from the Ephemeral Staging bucket.
+
+(A 24-hour S3 Lifecycle policy acts as a failsafe to auto-delete anything left behind if the Lambda crashes).
+
+Advantages
+Infinite Payload Scaling: Your integration pipeline can smoothly route a 2 KB heart rate ping or a 2 GB DICOM imaging bundle using the exact same queue architecture without crashing.
+
+Cost Efficiency: SQS charges by the request and payload size. Pushing 15 MB through a messaging layer is expensive. S3 is vastly cheaper for holding large blobs of data for a few seconds.
+
+Bulletproof Compliance: Because the heavy payload is kept out of the queue and isolated in an ephemeral S3 bucket that auto-purges, you legally prove that you are only holding the data "in transit," maintaining your Zero-PHI status.
+
+
+To solve the "Heavy Payload vs. 256 KB Limit" problem from a completely blank AWS account, we must build a decoupled storage and messaging layer. We will create an ephemeral S3 drop-zone for the massive files and an SQS FIFO queue for the lightweight pointers.
+
+Here is the complete, standalone implementation guide to build the Claim-Check Pattern.
+
+1. **Build the Ephemeral Staging Zone (Amazon S3):** This creates the temporary holding area for massive patient bundles and enforces the 24-hour Zero-PHI failsafe..
+1. Open the **AWS Management Console** and search for **S3**.
+2. Click **Create bucket**. Name it `omnihealth-ephemeral-staging-zone` (bucket names must be globally unique).
+3. Ensure **Block all public access** is checked.
+4. Under **Default encryption**, select **Server-side encryption with AWS Key Management Service keys (SSE-KMS)** and choose the default `aws/s3` key to encrypt the PHI at rest.
+5. Click **Create bucket**.
+6. Click on your newly created bucket and navigate to the **Management** tab.
+7. Under **Lifecycle rules**, click **Create lifecycle rule**. Name it `24-Hour-PHI-Hard-Purge`.
+8. Select **Apply to all objects in the bucket** and check the acknowledgment box.
+9. Check **Expire current versions of objects** and set **Days after object creation** to `1`.
+10. Click **Create rule**. *(This guarantees that if a Lambda crashes, AWS physically wipes the patient data at midnight).*
+
+
+2. **Build the Ticket Queue (Amazon SQS FIFO):** This creates the high-speed signaling lane that maintains strict chronological order without carrying heavy data..
+1. Search for **SQS** in the console.
+2. Click **Create queue**.
+3. Select **FIFO** (First-In-First-Out is critical for chronological healthcare records).
+4. Name the queue `omnihealth-transfer-tickets.fifo` (the `.fifo` extension is mandatory).
+5. Scroll down to **High throughput FIFO queue** and toggle it **On** (enables higher API request limits).
+6. Under **Encryption**, leave AWS KMS enabled.
+7. Click **Create queue**.
+8. Copy the **URL** of this queue from the details page for use in your Mirth code.
+
+
+---
+
+### Step 3: Mirth Connect Code (Generating the Claim-Check)
+
+When Mirth receives a 15 MB payload, it must drop the heavy file into S3, generate the tiny 1 KB ticket, and push that ticket into SQS.
+
+*Note: This JavaScript requires the AWS Java SDK `.jar` files to be loaded into your Mirth Connect `custom-lib` folder.*
+
+```javascript
+// MIRTH JAVASCRIPT WRITER: The Claim-Check Producer
+importPackage(java.util);
+importPackage(com.amazonaws.services.s3);
+importPackage(com.amazonaws.services.sqs);
+importPackage(com.amazonaws.services.sqs.model);
+
+try {
+    var rawPayload = connectorMessage.getRawData(); // The 15 MB FHIR Bundle
+    var correlationId = UUID.randomUUID().toString();
+    var patientId = "Patient-12345"; // Extracted dynamically in reality
+    
+    // 1. THE HEAVY DROP (S3)
+    var s3Client = AmazonS3ClientBuilder.defaultClient();
+    var ephemeralBucket = "omnihealth-ephemeral-staging-zone";
+    var s3Key = "transfers/" + correlationId + ".json";
+    
+    s3Client.putObject(ephemeralBucket, s3Key, rawPayload);
+    logger.info("Successfully staged 15MB payload to S3: " + s3Key);
+
+    // 2. CREATE THE LIGHTWEIGHT TICKET
+    var claimCheckTicket = {
+        "event_type": "NEW_TRANSFER",
+        "s3_bucket": ephemeralBucket,
+        "s3_key": s3Key,
+        "correlation_id": correlationId,
+        "patient_group_id": patientId
+    };
+
+    // 3. PASS THE TICKET (SQS FIFO)
+    var sqsClient = AmazonSQSClientBuilder.defaultClient();
+    var queueUrl = "https://sqs.ap-south-1.amazonaws.com/123456789012/omnihealth-transfer-tickets.fifo";
+    
+    var sendMessageRequest = new SendMessageRequest()
+        .withQueueUrl(queueUrl)
+        .withMessageBody(JSON.stringify(claimCheckTicket))
+        .withMessageGroupId(patientId) // Ensures strict ordering per patient
+        .withMessageDeduplicationId(correlationId); // Prevents duplicate tickets
+        
+    sqsClient.sendMessage(sendMessageRequest);
+    logger.info("Successfully queued ticket to SQS for Correlation ID: " + correlationId);
+    
+    responseMap.put("HTTP_STATUS", 202);
+    return "Queued successfully";
+
+} catch (e) {
+    logger.error("Claim-Check Generation Error: " + e.message);
+    responseMap.put("HTTP_STATUS", 500);
+    return "Internal Error: " + e.message;
+}
+
+```
+
+---
+
+### Step 4: AWS Lambda Code (Cashing the Ticket & Settlement)
+
+The backend Lambda is configured with an SQS Trigger. It wakes up when a ticket arrives, uses the ticket to download the heavy payload from S3 directly into its RAM, transmits the data, and then permanently destroys the file in S3 to maintain Zero-PHI compliance.
+
+```python
+import json
+import boto3
+import requests
+
+s3_client = boto3.client('s3')
+
+def lambda_handler(event, context):
+    # Event contains the SQS records
+    for record in event['Records']:
+        
+        # 1. READ THE TICKET
+        claim_check = json.loads(record['body'])
+        bucket_name = claim_check['s3_bucket']
+        object_key = claim_check['s3_key']
+        
+        try:
+            # 2. CASH IN THE TICKET (Download 15MB file into volatile RAM)
+            s3_response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+            heavy_fhir_payload = s3_response['Body'].read().decode('utf-8')
+            
+            # 3. PROCESS THE DATA (Send to Hospital B)
+            hospital_b_url = "https://emr.hospital-b.com/fhir/Bundle"
+            api_response = requests.post(
+                hospital_b_url, 
+                data=heavy_fhir_payload, 
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            # 4. TEAR UP THE TICKET (The Settlement)
+            if api_response.status_code in [200, 201]:
+                
+                # Instantly destroy the heavy PHI file from the staging bucket
+                s3_client.delete_object(Bucket=bucket_name, Key=object_key)
+                print(f"Success: Transfer complete and staging data {object_key} destroyed.")
+                
+            else:
+                # If the external API fails, raise an exception
+                # This leaves the ticket in SQS and the payload in S3 for a retry later
+                raise Exception(f"Hospital B rejected payload: {api_response.text}")
+                
+        except Exception as e:
+            print(f"Error processing claim check for {object_key}: {str(e)}")
+            raise e
+
+```

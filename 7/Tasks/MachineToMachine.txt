@@ -1,0 +1,258 @@
+Tasks 2.2, 3, and 12 all share the exact same architectural blueprint: The Asynchronous Machine-to-Machine Ingestion Pipeline.
+
+Unlike human UI access, these tasks handle high-volume, continuous data streams originating from external untrusted devices (Block 1) and route them through the OmniHealth Hub (Block 2) into the heavily guarded hospital databases (Block 3).
+
+Here is the master execution flow for how all of these streaming ingestion tasks operate at a Principal-Architect level.
+
+The Master Execution Flow: Asynchronous Streaming & Ingestion
+Step 1: Post-Quantum Ingress & Noisy Neighbor Defense
+The Action: The external device (Mobile App, Bedside Monitor, or IoT Sensor) pushes raw telemetry to the Hub's Ingest ALB (e.g., POST [https://ingest.omnihealth.com/](https://ingest.omnihealth.com/)...).
+
+The Enterprise Standard:
+
+The connection is secured via Hybrid Post-Quantum TLS 1.3 to defend against "Harvest Now, Decrypt Later" threats.
+
+AWS WAF applies Tenant-Aware Rate Limiting. If Hospital A's IoT sensors malfunction and blast 10,000 requests per second, WAF throttles Hospital A instantly at the edge, ensuring Hospital B's bedside monitors continue streaming without interruption.
+
+AWS X-Ray injects an X-Correlation-ID to track the telemetry across the entire cloud.
+
+Step 2: In-Memory Translation & Schema Validation
+The Action: The ALB routes the payload privately to the Mirth Connect cluster.
+
+The Enterprise Standard:
+
+Mirth translates the raw JSON or HL7 data into standardized FHIR R4 Observations strictly in volatile RAM (Zero Disk Write).
+
+Before proceeding, it runs the payload through an HL7 FHIR Schema Validator. If a firmware update on a Fitbit or IoT sensor corrupts the JSON schema, the validator instantly routes the bad packet to a Quarantine Queue, preventing malformed data from continuously crashing downstream Lambdas.
+
+Step 3: The Claim-Check Pattern & Isolated Queuing
+The Action: Mirth stages the payload and queues the event for processing.
+
+The Enterprise Standard:
+
+To bypass SQS size limits and retain Zero-PHI compliance, Mirth writes the encrypted FHIR payload to the Amazon S3 Ephemeral Staging Bucket (The Claim-Check).
+
+Mirth pushes a tiny pointer event into a Tenant-Specific SQS FIFO Queue (e.g., hosp-a-observations.fifo).
+
+To eliminate Head-of-Line Blocking, the MessageGroupId is dynamically set to the Patient_ID or Sensor_ID. If Patient X's record fails, SQS bypasses it and continues processing Patient Y in parallel.
+
+Step 4: Serverless Compute & Adaptive Backpressure
+The Action: The SQS FIFO queue triggers the respective processor Lambda (e.g., OPENEMR_POST_LAMBDA or IOT_STORE_LAMBDA) via an internal PrivateLink endpoint.
+
+The Enterprise Standard:
+
+Adaptive Backpressure: The Lambda's SQS Event Mapping enforces a strict concurrency limit (e.g., Max 10). This guarantees your cloud scale never accidentally DDoS-attacks and crashes the hospital's legacy database.
+
+Secret Caching: The Lambda uses the AWS Parameters and Secrets Extension to pull the target hospital's OIDC tokens from encrypted local RAM (
+<5 ms) instead of querying Secrets Manager over the network, eliminating API throttling.
+
+Step 5: Zero-Trust Egress & DNS Exfiltration Guardrails
+The Action: The Lambda sends the data to the destination hospital.
+
+The Enterprise Standard:
+
+As the request attempts to leave the VPC, the AWS Route 53 Resolver DNS Firewall verifies no compromised code is attempting to exfiltrate patient data via DNS Tunneling.
+
+The packet passes through the AWS Network Firewall (enforcing domain allow-lists) and the NAT Gateway, stamping it with OmniHealth's Static Elastic IP.
+
+At the Hospital's ALB, the connection presents a client certificate auto-rotated by AWS Private CA, completing the Mutual TLS (mTLS) handshake. The hospital validates the Static IP and the cert, allowing the data into their private subnet.
+
+Step 6: Immediate Settlement & WORM Auditing
+The Action: The hospital database returns 201 Created.
+
+The Enterprise Standard:
+
+The Lambda executes an immediate s3:DeleteObject to cryptographically erase the staged file, guaranteeing OmniHealth retains zero PHI.
+
+A WORM receipt (containing the Correlation_ID and a SHA-256 hash of the payload, but zero patient details) is written to the 7-Year S3 Object Lock Audit Bucket.
+
+CloudWatch Logs Data Protection actively scans the Lambda's console output, automatically redacting any accidentally printed PHI (*****REDACTED*****) before writing logs to disk.
+
+How This Maps to Your Specific Tasks
+While the pipeline is identical, the entry and exit points differ for each data stream:
+
+Task 2.2 (Fitbit to OpenEMR A):
+
+Ingress: Mobile app calls POST /fitbit on Hub ALB.
+
+Path: Staged in S3, queued in hosp-a-observations.fifo.
+
+Egress: OPENEMR_POST_LAMBDA posts FHIR Observation to emr.hospital-a.com (Block 3).
+
+Task 3 (Bedside Monitor to OpenEMR A):
+
+Ingress: Hardware monitor streams continuous HL7 to POST /hl7 on Hub ALB.
+
+Path: Translated to FHIR by Mirth, staged in S3, queued in hosp-a-observations.fifo.
+
+Egress: OPENEMR_POST_LAMBDA posts FHIR Observation to emr.hospital-a.com (Block 3).
+
+Task 12 (IoT Water Quality to OpenEMR B):
+
+Ingress: IoT hardware pushes to POST /iot/water on Hub ALB.
+
+Path: Staged in S3, queued in hosp-b-iot.fifo.
+
+Egress: IOT_STORE_LAMBDA posts to emr.hospital-b.com (Block 3), where it is stored for future retrieval.
+
+
+### Mirth Connect (Ingress & Claim-Check for Task 2.2)
+
+This JavaScript runs inside Mirth Connect's destination writer. It receives the Fitbit JSON payload from the mobile app, stages the heavy payload in S3 to keep the messaging layer lightweight, and pushes a pointer to Hospital A's isolated FIFO queue.
+
+```javascript
+// MIRTH JAVASCRIPT WRITER: Task 2.2 Fitbit to OpenEMR Ingestion
+importPackage(java.util);
+importPackage(com.amazonaws.services.s3);
+importPackage(com.amazonaws.services.sqs);
+importPackage(com.amazonaws.services.sqs.model);
+
+try {
+    var rawPayload = connectorMessage.getRawData();
+    var payloadJson = JSON.parse(rawPayload);
+    
+    var correlationId = channelMap.get('X-Correlation-ID') || UUID.randomUUID().toString();
+    
+    // 1. EXTRACT SHARD KEY (Prevent Head-of-Line Blocking)
+    // Extracting the patient ID ensures that if this Fitbit sync fails, 
+    // it only blocks this specific patient, allowing other patients to process in parallel.
+    var patientId = payloadJson.patient_id || "UNKNOWN_PATIENT";
+
+    // 2. THE CLAIM-CHECK DROP (Zero-PHI Messaging)
+    var s3Client = AmazonS3ClientBuilder.defaultClient();
+    var ephemeralBucket = "omnihealth-ephemeral-staging-zone";
+    var s3Key = "fitbit-syncs/hosp-a/" + correlationId + ".json";
+    
+    s3Client.putObject(ephemeralBucket, s3Key, rawPayload);
+    logger.info("Fitbit payload staged securely in S3: " + s3Key);
+
+    // 3. QUEUE THE TICKET (Push 1KB pointer to Hospital A's isolated queue)
+    var ticket = {
+        "event_type": "FITBIT_VITALS_SYNC",
+        "s3_bucket": ephemeralBucket,
+        "s3_key": s3Key,
+        "correlation_id": correlationId,
+        "patient_id": patientId
+    };
+
+    var sqsClient = AmazonSQSClientBuilder.defaultClient();
+    var queueUrl = "https://sqs.ap-south-1.amazonaws.com/123456789012/omnihealth-hosp-a-observations.fifo";
+    
+    var sendMessageRequest = new SendMessageRequest()
+        .withQueueUrl(queueUrl)
+        .withMessageBody(JSON.stringify(ticket))
+        .withMessageGroupId("Patient-" + patientId) // Logical Sharding Key
+        .withMessageDeduplicationId(correlationId);
+        
+    sqsClient.sendMessage(sendMessageRequest);
+    
+    responseMap.put("HTTP_STATUS", 202);
+    return "Queued for Hospital A Ingestion";
+
+} catch (e) {
+    logger.error("Fitbit Ingress Error: " + e.message);
+    responseMap.put("HTTP_STATUS", 500);
+    return "Error: " + e.message;
+}
+
+```
+
+### AWS Lambda (OPENEMR_POST_LAMBDA for Task 2.2)
+
+This Python Lambda is triggered by `omnihealth-hosp-a-observations.fifo`. It retrieves the staging ticket, uses the local RAM extension to grab Hospital A's credentials in `<5ms`, pushes the data via mTLS, and permanently deletes the PHI to settle the transaction.
+
+```python
+import json
+import boto3
+import requests
+import os
+import hashlib
+from datetime import datetime
+from aws_lambda_powertools import Logger
+
+logger = Logger(service="OmniHealth-Task2-2-Worker")
+
+s3_client = boto3.client('s3')
+WORM_BUCKET = "omnihealth-audit-worm-vault"
+
+# Local Proxy for Secrets Manager Extension (Zero network latency)
+SECRET_NAME = "omnihealth/hospital-a/credentials"
+LOCAL_CACHE_URL = f"http://localhost:2773/secretsmanager/get?secretId={SECRET_NAME}"
+
+# mTLS Certificates for Zero-Trust Egress
+CLIENT_CERT = '/tmp/omnihealth-client.pem'
+PRIVATE_KEY = '/tmp/omnihealth-private.key'
+
+def get_cached_credentials():
+    """Fetches Hospital A credentials from the Lambda Extension RAM cache."""
+    aws_token = os.environ.get('AWS_SESSION_TOKEN')
+    response = requests.get(LOCAL_CACHE_URL, headers={"X-Aws-Parameters-Secrets-Token": aws_token})
+    secret_string = response.json().get('SecretString', '{}')
+    return json.loads(secret_string)
+
+def lambda_handler(event, context):
+    failed_messages = []
+    
+    for record in event['Records']:
+        message_id = record['messageId']
+        ticket = json.loads(record['body'])
+        
+        correlation_id = ticket.get('correlation_id')
+        bucket_name = ticket.get('s3_bucket')
+        object_key = ticket.get('s3_key')
+        
+        try:
+            # 1. CASH THE TICKET (Download Fitbit payload from S3)
+            s3_response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+            fitbit_payload = s3_response['Body'].read().decode('utf-8')
+            
+            # 2. SUB-MILLISECOND CREDENTIAL RETRIEVAL
+            creds = get_cached_credentials()
+            api_key = creds.get('hosp_a_api_key')
+            
+            # 3. ZERO-TRUST EGRESS TO OPENEMR A
+            hospital_a_url = "https://emr.hospital-a.com/fhir/Observation"
+            response = requests.post(
+                hospital_a_url, 
+                data=fitbit_payload, 
+                headers={
+                    "Content-Type": "application/json", 
+                    "Authorization": f"Bearer {api_key}",
+                    "X-Correlation-ID": correlation_id
+                },
+                cert=(CLIENT_CERT, PRIVATE_KEY), # OSI Layer 4 mTLS Identity
+                timeout=5
+            )
+            
+            if response.status_code not in [200, 201]:
+                raise Exception(f"OpenEMR rejected payload: {response.text}")
+                
+            # 4. DATA DESTRUCTION (Zero-PHI Compliance)
+            s3_client.delete_object(Bucket=bucket_name, Key=object_key)
+            logger.info(f"Staged Fitbit data {object_key} permanently destroyed.")
+            
+            # 5. WORM SETTLEMENT
+            payload_hash = hashlib.sha256(fitbit_payload.encode()).hexdigest()
+            receipt = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "correlation_id": correlation_id,
+                "event": "TASK_2_2_FITBIT_SYNC_COMPLETED",
+                "payload_sha256": payload_hash,
+                "staging_data_purged": True
+            }
+            s3_client.put_object(
+                Bucket=WORM_BUCKET,
+                Key=f"receipts/task2_2/{datetime.utcnow().strftime('%Y/%m/%d')}/{correlation_id}.json",
+                Body=json.dumps(receipt),
+                ContentType="application/json"
+            )
+            
+        except Exception as e:
+            logger.error(f"Fitbit sync failed for {correlation_id}: {str(e)}")
+            # Append to failed messages so SQS retries this specific message later
+            failed_messages.append({"itemIdentifier": message_id})
+
+    # Return partial batch failures to SQS to prevent Head-of-Line blocking
+    return {"batchItemFailures": failed_messages}
+
+```

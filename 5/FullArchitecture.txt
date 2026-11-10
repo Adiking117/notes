@@ -1,0 +1,128 @@
+# OmniHealth Integration Platform: Comprehensive Enterprise Architecture & Security Design Document
+
+---
+
+## 1. Executive Summary & Architectural Remediation
+
+This document outlines the production-grade, multi-tenant AWS architecture for the OmniHealth Integration Platform. The design explicitly transitions the system from a localized Proof of Concept (PoC) into a secure, Zero-Trust SaaS model, directly addressing enterprise architectural requirements and security critiques.
+
+The primary remediation involves dismantling the "single shared network" approach. The platform is strictly divided into three distinct logical boundaries to enforce tenant isolation, identity-based routing (OAuth 2.0), and secure network perimeters using Fully Qualified Domain Names (FQDNs) rather than unauthenticated local IP addresses.
+
+---
+
+## 2. Block 1: Data Producers (Ingress Sources)
+
+This block represents the external world—the devices and interfaces generating healthcare telemetry. These producers push data over the public internet using HTTPS (TLS 1.3) to the OmniHealth Hub.
+
+* **Local Bedside Monitors:** Emitting continuous HL7 packets.
+* **Mobile Applications:** React Native applications pushing Fitbit JSON vitals and viewing real-time IoT water quality metrics.
+* **IoT Devices:** Remote water quality sensors emitting environmental telemetry.
+* **Hospital Source Systems:** Initiating cross-network patient transfer payloads.
+
+---
+
+## 3. Block 2: OmniHealth SaaS Hub (The Integration Broker)
+
+Block 2 is the core proprietary processing engine housed in an OmniHealth-owned AWS Virtual Private Cloud (VPC). It acts strictly as a secure integration broker, never hosting downstream consumer databases.
+
+### 3.1 Public Edge (Ingress Security)
+
+* **Amazon Route 53:** Resolves public ingest domains (e.g., `ingest.omnihealth.com`).
+* **Application Load Balancer (ALB) & AWS WAF:** Located in the Hub's Public Subnet. The ALB decrypts incoming traffic using AWS Certificate Manager (ACM), while the Web Application Firewall (WAF) scrubs payloads for SQL injection and cross-site scripting before allowing data inside.
+
+### 3.2 Private Processing & Translation
+
+* **Mirth Connect (Amazon EC2):** Housed exclusively in the Private Subnet with no direct internet access. It receives clean payloads from the ALB, translates proprietary formats into standardized FHIR bundles, and routes data.
+* **Amazon S3 (Staging & IoT Data Lake):** Acts as an asynchronous staging ground and storage lake. Mirth writes raw incoming data/IoT telemetry to S3, which triggers asynchronous event pipelines.
+
+### 3.3 Serverless Compute, Eventing & Zero-Trust Security
+
+* **Amazon EventBridge:** Listens to S3 bucket events (such as file drops) to instantly trigger appropriate serverless processing workflows.
+* **AWS PrivateLink (VPC Endpoint):** Creates an internal tunnel allowing Mirth to push data to the API Gateway without traversing the public internet.
+* **Amazon API Gateway (Private/Public):** Receives internal payloads or handles secure client requests (such as mobile app queries and Omniviewer proxy calls).
+* **AWS Lambda Functions:** The core business logic workers, including:
+* `FITBIT_FETCHER_LAMBDA`: Pulls and auto-rotates Fitbit tokens.
+* `OPENEMR_POST` / `FHIR_POST` / `MRS_LAMBDA`: Handles clinical data routing to hospitals.
+* `OMNIVIEWER_FHIR_PROXY`: Securely proxies UI data requests.
+* `ARVR_PROCESSOR_LAMBDA`: Converts 3D medical mesh/DICOM volumes.
+* `IOT_DATA_FETCHER_LAMBDA`: Safely returns water quality values to the mobile app.
+
+
+* **AWS Secrets Manager:** The cornerstone of the Zero-Trust egress. Vaults all third-party client IDs, secrets, token URLs, and auto-rotating refresh tokens.
+
+---
+
+## 4. Block 3: Consumer Environments (Isolated Hospital Networks)
+
+Block 3 represents distinct, customer-owned environments. To satisfy strict healthcare compliance (HIPAA), Hospital A and Hospital B are deployed in completely separate AWS VPCs with zero shared infrastructure.
+
+### 4.1 The Hospital Front Door & Human Identity (Cognito)
+
+* **Public Application Load Balancer (ALB):** Serves as the secure entry point for each hospital, resolving to official FQDNs (e.g., `emr.hospital-a.com`).
+* **Amazon Cognito User Pools:** Attached to each hospital's respective ALB to intercept human UI traffic. It enforces Multi-Factor Authentication (MFA) and provides a centralized Single Sign-On (SSO) experience for all applications within that hospital network. Separate User Pools isolate Hospital A human users from Hospital B human users.
+
+### 4.2 Application & Data Layers (Consolidated Hosting)
+
+* **Consolidated App Hosting (Nginx Reverse Proxy):** To optimize costs while maintaining isolation, physical applications share dedicated EC2 instances inside private subnets, separated by organization:
+* *Hospital A EC2 Instance #1:* Hosts OpenEMR-A (`emr.hospital-a.com`).
+* *Hospital A EC2 Instance #2:* Hosts Omniviewer (`omniviewer.hospital-a.com`) and Knowledge Graph (`kg.hospital-a.com`) using Nginx path/subdomain routing.
+* *Hospital B EC2 Instance #1:* Hosts OpenEMR-B (`emr.hospital-b.com`).
+* *Hospital B EC2 Instance #2:* Hosts OpenMRS (`openmrs.hospital-b.com`).
+
+
+* **Amazon RDS (MySQL):** Dedicated, isolated database backends for each hospital's clinical records.
+
+---
+
+## 5. Granular Task Flows & Architectural Implementation
+
+### Task 1, 4, 5, 9, 11: Human Web Application Access
+
+* **Flow:** A human user types an application URL (`emr.hospital-a.com`, `omniviewer.hospital-a.com`, etc.). The request hits the hospital's public ALB. The attached **Amazon Cognito User Pool** intercepts the request, presents an MFA login screen, and issues a secure session token. Once authenticated, the ALB forwards traffic to the target EC2 instance, where **Nginx** routes it to the specific application.
+
+### Task 2.1 & 2.2: Fitbit Ingestion to OpenEMR A
+
+* **Flow 2.1:** The mobile app triggers the Hub's `FITBIT_FETCHER_LAMBDA`. The Lambda fetches Fitbit credentials and an auto-rotating `refresh_token` from **AWS Secrets Manager**, queries Fitbit's OAuth endpoint for a fresh access token, pulls health telemetry, and updates the rotated refresh token back into Secrets Manager.
+* **Flow 2.2:** The mobile app posts JSON vitals to `[https://ingest.omnihealth.com/fitbit](https://ingest.omnihealth.com/fitbit)`. The hub ALB/WAF inspects it, and **Mirth** translates it into a FHIR bundle. Mirth triggers `OPENEMR_POST_LAMBDA` via PrivateLink. The Lambda dynamically fetches OpenEMR-A's API credentials from Secrets Manager, exchanges them for a token, and pushes the payload via TLS 1.3 to `[https://emr.hospital-a.com/fhir/Observation](https://emr.hospital-a.com/fhir/Observation)`.
+
+### Task 3 & 12: Bedside Monitor (BSM) & IoT Data Ingestion
+
+* **Flow:** Physical devices post telemetry to Hub public ingest endpoints (`/hl7` or `/iot/water`). Mirth processes the data and stages raw JSON files into the Hub's **Amazon S3 Staging Bucket**. S3 event notifications trigger **Amazon EventBridge**, which fires backend Lambdas (`OPENEMR_POST_LAMBDA` or `IOT_STORE_LAMBDA`). These Lambdas fetch hospital tokens from Secrets Manager and push data securely to Hospital A or B.
+
+### Task 6: Omniviewer Vital Fetch from OpenEMR A
+
+* **Flow:** The Omniviewer frontend makes an API call to the OmniHealth Hub rather than talking directly to OpenEMR via local IPs. The request triggers the `OMNIVIEWER_FHIR_PROXY` Lambda, which retrieves OpenEMR-A's secure API token from Secrets Manager, makes an authenticated HTTPS GET request to Hospital A's public FQDN (`[https://emr.hospital-a.com/fhir/](https://emr.hospital-a.com/fhir/)...`), and streams data back to the UI.
+
+### Task 7: AR/VR Generation from Omniviewer
+
+* **Flow:** A user triggers 3D conversion in Omniviewer. The Hub's API Gateway invokes the `ARVR_PROCESSOR_LAMBDA`, which executes background processing logic (such as headless Blender conversion scripts) and saves the output mesh files securely into the Hub's S3 storage bucket.
+
+### Task 8 & 10: Inter-Hospital & OpenMRS Data Transfers
+
+* **Flow:** Hospital source systems post transfer records to the Hub ingest endpoint. Mirth writes the payload to S3. **EventBridge** detects the file drop and instantly invokes `FHIR_POST_LAMBDA` (for OpenEMR B) or `MRS_LAMBDA` (for OpenMRS). These Lambdas fetch destination credentials from Secrets Manager and securely deliver the standardized data to Hospital B's FQDN endpoints.
+
+### Task 13: Mobile App IoT Data Retrieval
+
+* **Flow:** The React Native mobile app queries the Hub API endpoint (`[https://api.omnihealth.com/iot/water/latest](https://api.omnihealth.com/iot/water/latest)`). This triggers the `IOT_DATA_FETCHER_LAMBDA`, which uses strict IAM roles to read the latest water quality JSON file directly from the private S3 bucket and return it safely to the mobile app client.
+
+---
+
+## 6. Master Secrets Manager Inventory
+
+All backend machine credentials and tokens are strictly isolated in **AWS Secrets Manager**:
+
+1. **Hospital A OpenEMR API Credentials:** `client_id`, `client_secret`, `token_url`, `fhir_base_url`.
+2. **Hospital B OpenEMR API Credentials:** `client_id`, `client_secret`, `token_url`, `fhir_base_url`.
+3. **Hospital B OpenMRS Credentials:** `api_username`, `api_password`, `base_url`.
+4. **Fitbit Integration Credentials:** `client_id`, `client_secret`, `refresh_token` (with automated rotation).
+
+---
+
+## 7. Master Cognito User Pools Inventory
+
+Human authentication is managed via edge-attached user pools:
+
+1. **`Cognito-Pool-Hospital-A`:** Attached to Hospital A's ALB; manages SSO for OpenEMR-A, Omniviewer, and Knowledge Graph.
+2. **`Cognito-Pool-Hospital-B`:** Attached to Hospital B's ALB; manages SSO for OpenEMR-B and OpenMRS.
+
+Is there any final section or specific component you would like to expand before you begin drawing your comprehensive architecture diagram?

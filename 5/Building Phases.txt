@@ -1,0 +1,59 @@
+Here is the exact, chronological execution plan to build this entire enterprise architecture from scratch, assuming all three blocks are running on AWS.
+In the real world of cloud engineering, you build the destinations first, the routing engine second, and the public front doors last.
+
+Phase 1: Build the Customer Environments (Block 3)
+You cannot program your OmniHealth Hub to send data to Hospital A if Hospital A does not exist yet. We build the isolated customers first.
+ * Create Isolated VPCs: Create two completely separate AWS Virtual Private Clouds (VPCs). One is named Hospital-A-VPC, the other Hospital-B-VPC.
+ * Deploy the Databases: Inside each VPC's private subnet, deploy an Amazon RDS for MySQL instance.
+ * Deploy the Applications: Spin up EC2 instances in each VPC to host OpenEMR and Omniviewer. Connect them to their respective RDS databases.
+ * Create the Hospital Front Doors: For each hospital, deploy a public-facing Amazon API Gateway (or ALB) and attach an AWS Cognito authorizer (or OAuth 2.0 provider). This acts as the hospital's security guard.
+ When you configure ALB, you set up two distinct routing rules:
+Rule 1 (API & Token Paths): For paths starting with /oauth2/ or /fhir/, the ALB rule is set to Bypass Cognito / Pass-Through. It forwards the request straight to the EC2 target group hosting OpenEMR without ever asking for a human user login.
+Rule 2 (UI Paths): For everything else (/*), the ALB rule is enforced with Amazon Cognito Authentication for human staff.
+ * Register the FQDNs: Use Route 53 to map their API Gateways to public domains: api.hospital-a.com and api.hospital-b.com.
+   * Result: Block 3 is now live. The hospitals are secure, isolated, and waiting for authorized data.
+   
+   
+Phase 2: Build the OmniHealth Hub Foundations (Block 2 - Internal)
+Now you build your own SaaS integration company's infrastructure.
+ * Create the Hub VPC: Create the OmniHealth-Hub-VPC with a Public Subnet and a Private Subnet.
+ * Deploy Mirth Connect: Launch an EC2 instance in the Private Subnet and install Mirth Connect. It has no public IP address, meaning the internet cannot reach it directly.
+ * Create the IoT Storage: Create an Amazon S3 Bucket to hold the raw Water Quality sensor data.
+ * Establish the Private Bridge: Create a VPC Endpoint (AWS PrivateLink) inside your Private Subnet.
+   * Why: This allows Mirth Connect to send its translated data to your serverless functions without the data accidentally bouncing out to the public internet.
+   
+   
+   
+Phase 3: Build the Serverless Brain & Security (Block 2 - Microservices)
+This is where you implement the "Zero Trust" requirements Saurabh demanded.
+ * Lock down the Credentials: Open AWS Secrets Manager. Store the client IDs, secrets, and OAuth passwords required to get into Hospital A and Hospital B.
+ * Deploy the Internal API Gateway: Create a Private API Gateway. This will catch the JSON payloads coming from Mirth Connect.
+ * Write and Deploy the Lambdas: Spin up your AWS Lambda functions (OPENEMR_POST, FHIR_POST, Authorize, etc.) using Python.
+   * Give them strict IAM Execution Roles: "You are only allowed to read Secrets Manager and make outbound internet requests."
+ * Code the Zero-Trust Egress: Inside the OPENEMR_POST Lambda code, write the logic:
+   * Step 1: Call Secrets Manager to get Hospital A's token.
+   * Step 2: Formulate the HTTPS POST request.
+   * Step 3: Send the payload over the public internet to [https://api.hospital-a.com/emr](https://api.hospital-a.com/emr).
+   
+   
+   
+Phase 4: Build the Fortified Ingress (Block 2 - Public Edge)
+Your internal hub is ready to process and route data. Now you must open a secure window to the outside world to let the bedside monitors send their payloads.
+ * Create the SSL Certificate: Go to AWS Certificate Manager (ACM) and request a public TLS 1.3 certificate for your ingest domain (e.g., ingest.omnihealth.com).
+ * Deploy the Web Application Firewall (WAF): Create an AWS WAF Web ACL. Turn on the managed rules for SQL Injection (SQLi) protection, Cross-Site Scripting (XSS), and bad bot blocking.
+ * Deploy the Application Load Balancer (ALB): Put the ALB in your Public Subnet.
+   * Attach the ACM certificate (so it can decrypt HTTPS).
+   * Attach the WAF (so it can inspect the decrypted payload).
+ * Set the Routing Rule: Tell the ALB: "If a request passes WAF inspection, forward the plain HTTP payload down to the internal IP address of the Mirth Connect EC2 instance."
+ * Connect the Internet (IGW): Attach an Internet Gateway to your VPC so the ALB can receive traffic from the outside world.
+ 
+ 
+ 
+Phase 5: Wire up the Real World (Block 1)
+Everything is built. Now you just point the physical devices to your cloud.
+ * Configure DNS: Go to Amazon Route 53 and point ingest.omnihealth.com to the public IP address of your ALB.
+ * Configure the Devices (Producers):
+   * Program the Local Bedside Monitor to push HL7 messages to [https://ingest.omnihealth.com/hl7](https://ingest.omnihealth.com/hl7).
+   * Program the React Native Mobile App to push Fitbit JSON to [https://ingest.omnihealth.com/fitbit](https://ingest.omnihealth.com/fitbit).
+   * Program the Water Quality Checker to push telemetry to [https://ingest.omnihealth.com/sensor](https://ingest.omnihealth.com/sensor).
+The system is now live. A bedside monitor emits a heart rate, it hits Route 53, enters the IGW, gets decrypted by the ALB, scrubbed by the WAF, translated by Mirth, authorized by API Gateway, processed by a Lambda, enriched with a secure OAuth token from Secrets Manager, and finally pushed securely to Hospital A's FQDN across the internet.

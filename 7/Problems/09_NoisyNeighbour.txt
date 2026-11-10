@@ -1,0 +1,145 @@
+The "Noisy Neighbor" problem occurs in multi-tenant cloud platforms when one customer (Hospital A) monopolizes shared infrastructure resources, degrading system performance or causing complete outages for other customers (Hospital B).
+
+What Would Have Happened If Ignored
+Imagine Hospital A runs a weekend batch script to migrate 2 million historical patient records into the OmniHealth Hub, hitting your API Gateway and Mirth instances with 10,000 requests per second.
+
+Compute Exhaustion: AWS Lambda has a default regional limit of 1,000 concurrent executions per account. Hospital A's massive payload instantly consumes all 1,000 containers.
+
+Queue Blocking: If you use a single shared SQS queue, Hospital A's 2 million messages clog the pipeline entirely.
+
+The Consequence: A doctor at Hospital B tries to sync a critical real-time IoT bedside monitor alert. Because Hospital A is hoarding the API Gateway bandwidth and Lambda concurrency, AWS drops Hospital B's request with a 429 Too Many Requests error, or the message gets stuck behind Hospital A's traffic in the queue for six hours. A critical clinical alert is dropped.
+
+How We Solved It (Architecture Integration)
+We implemented Tenant-Aware Rate Limiting and Physical Resource Sharding across three distinct layers of Block 2 (the OmniHealth Hub).
+
+Edge Layer (AWS WAF & API Gateway Usage Plans)
+
+We mapped each hospital to a dedicated API Gateway Usage Plan using tenant-specific API keys or JWT token inspection.
+
+We enforce strict throttling quotas. For example, Hospital A (Enterprise Tier) gets a hard cap of 1,000 requests per second, while Hospital B (Standard Tier) gets 200 requests per second. If Hospital A spikes to 5,000 req/sec, API Gateway instantly throttles only Hospital A. Hospital B's traffic continues flowing completely untouched.
+
+Messaging Layer (Tenant-Specific SQS FIFO Queues)
+
+Instead of dumping everything into one giant omnihealth-master.fifo queue, we provisioned physically isolated queues for each tenant: omnihealth-hosp-a.fifo and omnihealth-hosp-b.fifo.
+
+Inside those queues, we set the MessageGroupId to the Patient_ID. This ensures that even within Hospital A, a massive data dump for one patient does not block the real-time processing of another patient (eliminating Head-of-Line blocking).
+
+Compute Layer (Lambda Reserved Concurrency)
+
+We applied Reserved Concurrency limits to the Lambdas pulling from these SQS queues. We allocate a maximum of 300 concurrent Lambdas to Hospital A's pipeline and 100 to Hospital B's pipeline.
+
+This mathematically guarantees that Hospital A can never drain the AWS account's total global concurrency pool. Compute capacity is permanently held in reserve for Hospital B.
+
+Advantages
+Isolated Blast Radius: A runaway script, DDoS attack, or EMR misconfiguration at Hospital A cannot physically take down Hospital B's integrations.
+
+SLA and Billing Enforcement: You can confidently charge hospitals different pricing tiers based on their guaranteed API throughput (e.g., Premium vs. Basic).
+
+Predictable Cloud Billing: You prevent sudden AWS auto-scaling cost spikes caused by a single client's misbehaving software running unchecked over a weekend.
+
+
+To solve the "Noisy Neighbor" problem from a completely blank AWS account, we must implement physical resource sharding and strict rate limits across three layers: Edge (API Gateway), Messaging (SQS), and Compute (Lambda).
+
+Here is the complete, standalone implementation guide to build a Tenant-Aware, Noisy-Neighbor-immune architecture.
+
+1. **Create Tenant-Specific SQS FIFO Queues:** Messaging Layer: This physically separates the traffic so Hospital A's massive data dump cannot block Hospital B's real-time alerts..
+1. Open the **AWS Management Console** and search for **SQS**.
+2. Click **Create queue**.
+3. Select **FIFO** (mandatory for healthcare data ordering).
+4. Name the queue `omnihealth-hosp-a.fifo`.
+5. Scroll down to **High throughput FIFO queue** and enable it.
+6. Click **Create queue**.
+7. Copy the **Queue URL** from the details page.
+8. Repeat steps 2-6 to create a second queue named `omnihealth-hosp-b.fifo`.
+
+
+2. **Deploy Lambdas & Enforce Reserved Concurrency:** Compute Layer: This mathematically guarantees Hospital A can never consume the entire AWS account's execution capacity..
+1. Search for **Lambda** in the console. Click **Create function**.
+2. Name it `OmniHealth-Worker-Hosp-A`. Select **Python 3.12** and click **Create function**.
+3. Click on the **Configuration** tab, then select **Concurrency** from the left menu.
+4. Under **Reserve concurrency**, click **Edit**.
+5. Select **Reserve concurrency** and type `300`. Click **Save**. *(Hospital A can now scale to exactly 300 concurrent executions and no higher).*
+6. On the Lambda overview screen, click **Add trigger**. Select **SQS**, choose `omnihealth-hosp-a.fifo`, and click **Add**.
+7. Repeat this exact process to create `OmniHealth-Worker-Hosp-B`, but set its Reserved Concurrency strictly to `100`, and attach it to the `omnihealth-hosp-b.fifo` queue.
+
+
+3. **Build the API Gateway:** Edge Layer Part 1: This builds the front door that will intercept and identify incoming hospital traffic..
+1. Search for **API Gateway** in the console.
+2. Under **REST API**, click **Build**. Select **New API**, name it `OmniHealth-Ingest`, and click **Create API**.
+3. Click **Create Resource**, name it `transfer`, and click **Create Resource**.
+4. Select the `/transfer` resource, click **Create Method**, and select **POST**.
+5. Under **Integration type**, select **Lambda Function** and point it to an Ingest Router Lambda (we will write this code in the next section).
+6. **CRITICAL:** Click the **Method Request** tab. Set **API Key Required** to **true**. Click the checkmark to save.
+7. Click **Deploy API**, create a stage named `prod`, and deploy it.
+
+
+4. **Create Usage Plans and API Keys:** Edge Layer Part 2: This enforces the hard API throttling quotas, ensuring rogue scripts bounce at the perimeter..
+1. In the API Gateway console, click **API Keys** on the left menu.
+2. Click **Create API key**. Name it `Hospital-A-Enterprise-Key`. Click **Save**. Repeat to create `Hospital-B-Standard-Key`.
+3. Click **Usage Plans** on the left menu. Click **Create**.
+4. Name it `Enterprise-Tier`.
+5. Under **Throttling**, set **Rate** to `1000` (requests per second) and **Burst** to `2000`. Click **Next**.
+6. Associate this plan with your `OmniHealth-Ingest` API and the `prod` stage. Click **Next**.
+7. In the **API Keys** tab, click **Add API Key to Usage Plan** and select `Hospital-A-Enterprise-Key`.
+8. Repeat steps 3-7 to create a `Standard-Tier` plan (Rate: 200, Burst: 400) and attach the `Hospital-B-Standard-Key`.
+
+
+---
+
+## AWS Lambda Code (The Ingest Router & Head-of-Line Blocker)
+
+When a hospital hits your API Gateway, the API Gateway verifies their Usage Plan and passes the traffic to a lightweight Ingest Router Lambda.
+
+This Python code inspects the payload, determines which isolated tenant queue to use, and dynamically sets the `MessageGroupId` to the `patient_id`. **Setting the Patient ID as the group ID is the secret to preventing Head-of-Line blocking**—it tells AWS that if Patient X's massive file is taking a long time to process, AWS is free to spin up a parallel Lambda to process Patient Y simultaneously.
+
+```python
+import json
+import boto3
+import os
+
+sqs_client = boto3.client('sqs')
+
+# The physically sharded queues created in Step 1
+QUEUE_HOSP_A = "https://sqs.ap-south-1.amazonaws.com/123456789012/omnihealth-hosp-a.fifo"
+QUEUE_HOSP_B = "https://sqs.ap-south-1.amazonaws.com/123456789012/omnihealth-hosp-b.fifo"
+
+def lambda_handler(event, context):
+    try:
+        # 1. Identify the Tenant (API Gateway passes the Usage Plan API Key ID)
+        # Alternatively, you can extract the tenant ID from an OIDC JWT token.
+        tenant_context = event.get('requestContext', {}).get('identity', {}).get('apiKeyId')
+        
+        # 2. Parse the incoming payload
+        body = json.loads(event.get('body', '{}'))
+        patient_id = body.get('patient_id')
+        correlation_id = event.get('headers', {}).get('X-Correlation-ID', 'unknown')
+        
+        if not patient_id:
+            return {"statusCode": 400, "body": "patient_id is required"}
+
+        # 3. Route to the correct physically isolated queue
+        # In a real environment, you would map apiKeyIds to Tenant IDs in DynamoDB
+        target_queue = QUEUE_HOSP_B # Default fallback
+        if tenant_context == "api-key-id-for-hosp-a":
+            target_queue = QUEUE_HOSP_A
+            
+        # 4. QUEUE THE MESSAGE (Preventing Head-of-Line Blocking)
+        # MessageGroupId = patient_id guarantees that data for the same patient stays in strict 
+        # chronological order, but allows data for DIFFERENT patients to process concurrently.
+        sqs_client.send_message(
+            QueueUrl=target_queue,
+            MessageBody=json.dumps(body),
+            MessageGroupId=patient_id, 
+            MessageDeduplicationId=correlation_id
+        )
+        
+        return {
+            "statusCode": 202,
+            "body": json.dumps({"message": "Accepted and securely routed."})
+        }
+
+    except Exception as e:
+        print(f"Routing error: {str(e)}")
+        return {"statusCode": 500, "body": "Internal Router Error"}
+
+```

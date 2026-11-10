@@ -1,0 +1,82 @@
+Part 1: Master AWS Secrets Manager Inventory (Updated with Full OIDC Token Persistence)
+All backend machine credentials, integration secrets, and active OIDC token lifecycles are strictly isolated in AWS Secrets Manager (encrypted with AWS KMS Customer-Managed Keys / CloudHSM):
+
+1. Hospital A OpenEMR Integration & OIDC Token Set (Secret: omnihealth/hospital-a/credentials)
+Stored so backend Lambdas (OPENEMR_POST, FHIR_POST, OMNIVIEWER_FHIR_PROXY) can dynamically fetch, utilize, and refresh tokens to communicate with Hospital A:
+
+client_id: OpenEMR A's application client identifier.
+
+client_secret: OpenEMR A's application secret key.
+
+token_url: The OAuth 2.0 / OIDC SMART-on-FHIR token endpoint for Hospital A ([https://emr.hospital-a.com/oauth2/default/v1/token](https://emr.hospital-a.com/oauth2/default/v1/token)).
+
+fhir_base_url: The base URL for Hospital A's FHIR endpoints ([https://emr.hospital-a.com/fhir](https://emr.hospital-a.com/fhir)).
+
+access_token: The currently active, short-lived OIDC/OAuth access token used for API calls.
+
+refresh_token: The active refresh token used to generate fresh access tokens dynamically on expiration without re-prompting login.
+
+token_expires_at: Timestamp tracking token validity for automated proactive rotation.
+
+2. Hospital B OpenEMR Integration & OIDC Token Set (Secret: omnihealth/hospital-b/credentials)
+Stored so backend Lambdas can authenticate, refresh tokens, and push data or cross-transfers to Hospital B:
+
+client_id: OpenEMR B's application client identifier.
+
+client_secret: OpenEMR B's application secret key.
+
+token_url: The OAuth 2.0 / OIDC token endpoint for Hospital B ([https://emr.hospital-b.com/oauth2/default/v1/token](https://emr.hospital-b.com/oauth2/default/v1/token)).
+
+fhir_base_url: The base URL for Hospital B's FHIR endpoints ([https://emr.hospital-b.com/fhir](https://emr.hospital-b.com/fhir)).
+
+access_token: The currently active OIDC/OAuth access token for Hospital B.
+
+refresh_token: The active refresh token for auto-renewing sessions.
+
+token_expires_at: Timestamp tracking token expiration.
+
+3. Hospital B's OpenMRS API Credentials (Secret: omnihealth/hospital-b/openmrs)
+Stored so the MRS_LAMBDA can securely authenticate when syncing data from OpenEMR B to OpenMRS:
+
+api_username / client_id: OpenMRS service account username or app ID.
+
+api_password / client_secret: OpenMRS service account password or secret key.
+
+base_url: OpenMRS REST API endpoint ([https://emr.hospital-b.com/openmrs/ws/rest/v1](https://emr.hospital-b.com/openmrs/ws/rest/v1)).
+
+access_token / session_token: Active session/auth token if required by OpenMRS REST authentication.
+
+4. Fitbit / Google Health API Integration Credentials (Secret: omnihealth/integrations/fitbit)
+Stored so the FITBIT_FETCHER_LAMBDA can authenticate with Fitbit's external API and automatically handle token rotation:
+
+client_id: OmniHealth's developer app client ID registered with Fitbit.
+
+client_secret: OmniHealth's developer app client secret.
+
+access_token: Active Fitbit API access token.
+
+refresh_token: The active, auto-rotating refresh token used to generate fresh access tokens on the fly without manual intervention.
+
+Part 2: Master Amazon Cognito User Pools Inventory
+Human authentication is managed exclusively at the hospital network edge (Block 3) using dedicated user pools attached to each hospital's Application Load Balancer:
+
+1. Hospital A Cognito User Pool (Cognito-Pool-Hospital-A)
+Where it lives: Inside Block 3 (Hospital A's VPC), attached as an authorizer to Hospital A's public Application Load Balancer.
+
+Who uses it: Human users belonging to Hospital A (doctors, nurses, administrators, and patients).
+
+What it protects: It controls human UI access to all applications hosted on Hospital A's network (emr.hospital-a.com, omniviewer.hospital-a.com, and kg.hospital-a.com), providing a unified Single Sign-On (SSO) experience with Multi-Factor Authentication (MFA).
+
+2. Hospital B Cognito User Pool (Cognito-Pool-Hospital-B)
+Where it lives: Inside Block 3 (Hospital B's VPC), attached to Hospital B's public Application Load Balancer.
+
+Who uses it: Human users belonging to Hospital B (clinical staff, system operators).
+
+What it protects: It controls human UI access to Hospital B's applications (emr.hospital-b.com and openmrs.hospital-b.com).
+
+What about Block 2 (OmniHealth Hub)?
+Do you need a Cognito User Pool for the OmniHealth Hub? No.
+
+As established in our Zero-Trust architecture, the OmniHealth Hub acts as a backend integration broker. It processes automated data feeds (Bedside monitors, IoT water quality sensors, Mirth transformations, and SQS FIFO Lambda pipelines).
+
+Machine-to-machine authentication across the cloud is handled securely via AWS Secrets Manager (storing OIDC tokens, client credentials, and refresh tokens) and passwordless IAM Execution Roles, while the React Native mobile app handles its own end-user authentication against backend API tokens. Therefore, Cognito is kept strictly at the hospital edge (Block 3) for human UI logins.
